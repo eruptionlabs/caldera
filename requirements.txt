@@ -1,0 +1,2 @@
+# Caldera (caldera_designer.py): editor visual da HUD da Eruption Engine.
+pygame>=2.5
