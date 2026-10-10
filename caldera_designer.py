@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
 """
-Caldera HUD Designer - Editor visual de layout responsivo para Eruption Engine.
+Caldera - Editor visual de interface em CSS para Eruption Engine.
 
-Renderiza a HUD como a engine a desenha: lê data/hud/default.css, resolve
-posições/tamanhos igual ao CSSLayout C++ (src/utils/CSSLayout.cpp) e pinta
-cores, bordas, clip-paths, barras e slots. O personagem do preview é projetado
-com a mesma câmera e o mesmo billboard da engine, então widgets presos ao
-jogador (--bind-to-player) ficam onde ficariam no jogo.
+Abre qualquer .css de interface: o HUD da engine (data/hud/default.css, o
+padrao) ou os do projeto de um jogo (<projeto>/assets/ui/*.css). Renderiza como
+a engine desenha: resolve posicoes/tamanhos igual ao CSSLayout C++
+(src/utils/CSSLayout.cpp) e pinta cores, bordas, barras, textos e imagens. O
+personagem do preview e' projetado com a mesma camera e o mesmo billboard da
+engine, entao widgets presos ao jogador (--bind-to-player) ficam onde ficariam
+no jogo.
+
+Cada regra de id (#algo) e' um elemento; o tipo vem de --widget (rect | text |
+bar | image) e --parent: #outro faz as % valerem sobre o retangulo do pai.
+Cria, apaga, duplica, renomeia, reordena (z-index) e grava de volta sem mexer
+no que voce nao tocou (comentarios, ordem e formatacao das regras ficam).
+
+Uso:
+  caldera_designer.py                       HUD da engine
+  caldera_designer.py --css arquivo.css     um .css qualquer
+  caldera_designer.py --project <pasta>     projeto de jogo (abas com assets/ui/*.css)
 
 Regras de coordenadas (igual ao engine):
-- #boss-hp-bar, #hero-panel, #minimap: coordenadas em % da tela.
-- Todos os demais editáveis: coordenadas em % do #hero-panel.
+- Sem --parent: % da tela. Com --parent: % do retangulo do pai.
+- No HUD da engine, os widgets antigos sem --parent (#hero-portrait, #hero-hp-bar,
+  #skill-slots...) continuam sendo filhos do #hero-panel.
 """
 
 import pygame
@@ -18,6 +31,8 @@ import sys
 import os
 import re
 import math
+import glob
+import argparse
 from datetime import datetime
 
 def _find_engine_root():
@@ -392,6 +407,28 @@ EDITABLE_COMPONENTS = [
 # Propriedades gerenciadas pelo designer.
 LAYOUT_PROPS = {"position", "left", "top", "right", "bottom", "width", "height", "z-index"}
 
+# Tipos de elemento (--widget). Sem --widget: text se tem content, senao rect.
+WIDGET_TYPES = ('rect', 'text', 'bar', 'image')
+
+# Widgets antigos do HUD do motor: sem --parent, ficam dentro do #hero-panel
+# (so' vale no data/hud/default.css e quando a regra nao declara --parent).
+LEGACY_HUD_PARENT = {'#hero-portrait', '#hero-level', '#attr-matrix', '#hero-hp-bar',
+                     '#hero-sp-bar', '#equip-panel', '#skill-slots'}
+
+# Widgets do HUD do motor que o Caldera desenha com o desenho proprio deles
+# (quando a regra nao declara --widget).
+LEGACY_HUD_DRAW = {sel for _name, sel, _top in EDITABLE_COMPONENTS}
+
+# O contrato (docs do jogo, 12-ui-em-css) diz que text desenha so' o content.
+# Se o motor passar a desenhar fundo/borda tambem no text, vire para True.
+TEXT_DRAWS_BACKGROUND = False
+
+# Ordem das propriedades numa regra criada pelo Caldera (a mesma dos CSS escritos a mao).
+PROP_ORDER = ['--widget', '--parent', 'position', 'left', 'top', 'width', 'height',
+              'background-color', '--fill-color', 'border-color', 'border-width', 'border-radius',
+              'color', 'font-size', 'text-align', 'opacity', 'z-index', 'display', 'content',
+              '--value', '--image', '--bind-to-player']
+
 
 def parse_percent(value):
     if value is None:
@@ -476,12 +513,136 @@ def lerp_color(a, b, t):
     return tuple(int(x + (y - x) * t) for x, y in zip(a, b))
 
 
-class CSSRule:
-    def __init__(self, selector, properties, raw_text=""):
-        self.selector = selector
-        self.properties = properties
-        self.raw_text = raw_text
+ID_SELECTOR_RE = re.compile(r'^#[A-Za-z_][\w-]*$')
 
+
+def unquote(value):
+    """Tira aspas simples/duplas de um valor CSS (None passa direto)."""
+    if value is None:
+        return None
+    v = value.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+        return v[1:-1]
+    return v
+
+
+def _skip_string(s, i):
+    """s[i] e' uma aspa; devolve o indice logo depois da aspa que fecha."""
+    q = s[i]
+    i += 1
+    while i < len(s):
+        if s[i] == '\\':
+            i += 2
+            continue
+        if s[i] == q:
+            return i + 1
+        i += 1
+    return len(s)
+
+
+def _skip_comment(s, i):
+    """s[i:i+2] == '/*'; devolve o indice logo depois do '*/'."""
+    j = s.find('*/', i + 2)
+    return len(s) if j < 0 else j + 2
+
+
+class _Decl:
+    """Uma declaracao 'chave: valor;'. Enquanto o valor nao muda, grava o texto
+    original (espacos, caixa, comentario colado) exatamente como estava."""
+    __slots__ = ('key', 'value', 'raw', 'orig')
+
+    def __init__(self, key, value, raw=None):
+        self.key = key
+        self.value = value
+        self.raw = raw
+        self.orig = value
+
+    def emit(self):
+        if self.raw is not None and self.value == self.orig:
+            return self.raw
+        return f"{self.key}: {self.value};"
+
+
+class _Block:
+    """Uma regra 'seletor { ... }'. O corpo e' uma lista de str (espacos e
+    comentarios) e _Decl, na ordem do arquivo."""
+
+    def __init__(self, selector, head, items, nl='\n'):
+        self.selector = selector
+        self.head = head          # do seletor ate o '{' inclusive
+        self.items = items
+        self.nl = nl
+
+    def text(self):
+        return self.head + ''.join(i if isinstance(i, str) else i.emit() for i in self.items) + '}'
+
+    def find(self, key):
+        for it in reversed(self.items):
+            if isinstance(it, _Decl) and it.key == key:
+                return it
+        return None
+
+    def remove_decl(self, key):
+        i = 0
+        while i < len(self.items):
+            it = self.items[i]
+            if isinstance(it, _Decl) and it.key == key:
+                # leva junto a quebra de linha + indentacao que vinha antes
+                if i > 0 and isinstance(self.items[i - 1], str):
+                    prev = self.items[i - 1]
+                    stripped = prev.rstrip(' \t')
+                    if stripped.endswith('\n'):
+                        stripped = stripped[:-1]
+                        if stripped.endswith('\r'):
+                            stripped = stripped[:-1]
+                    self.items[i - 1] = stripped
+                del self.items[i]
+                continue
+            i += 1
+
+    def add_decl(self, key, value):
+        """Acrescenta no fim do bloco, com a indentacao da ultima declaracao."""
+        decl = _Decl(key, value)
+        last = None
+        for idx in range(len(self.items) - 1, -1, -1):
+            if isinstance(self.items[idx], _Decl):
+                last = idx
+                break
+        if last is None:
+            self.items = [self.nl + '    ', decl] + self.items
+            return
+        prev = self.items[last]
+        if prev.raw is not None and not prev.raw.rstrip().endswith(';'):
+            prev.orig = None      # ultima declaracao sem ';': reescreve com ';' para caber a nova
+        indent = '    '
+        if last > 0 and isinstance(self.items[last - 1], str):
+            tail = self.items[last - 1].rsplit('\n', 1)[-1]
+            if tail.strip() == '':
+                indent = tail
+        nxt = self.items[last + 1] if last + 1 < len(self.items) else ''
+        if isinstance(nxt, str) and '\n' in nxt:
+            # corta depois do que estiver na mesma linha (ex.: comentario colado)
+            cut = nxt.index('\n')
+            if cut > 0 and nxt[cut - 1] == '\r':
+                cut -= 1
+            self.items[last + 1:last + 2] = [nxt[:cut], self.nl + indent, decl, nxt[cut:]]
+        else:
+            self.items[last + 1:last + 1] = [' ', decl]
+
+
+class CSSRule:
+    def __init__(self, selector, blocks):
+        self.selector = selector
+        self.blocks = blocks          # o mesmo seletor pode aparecer mais de uma vez
+        self.properties = {}          # propriedades fundidas (a ultima vence)
+        self.reindex()
+
+    def reindex(self):
+        self.properties = {}
+        for b in self.blocks:
+            for it in b.items:
+                if isinstance(it, _Decl):
+                    self.properties[it.key] = it.value
 
 # ---------------------------------------------------------------------------
 # Preview do heroi: PNG estatico (assets/portraits). Sem parser de sprite.
@@ -545,51 +706,178 @@ class HeroPreview:
 
 
 class CSSDocument:
-    """Parser/serializer CSS simples que preserva comentários e regras não editáveis."""
+    """Parser/serializer CSS que preserva o arquivo: comentarios, espacos e a
+    ordem das regras ficam como estavam. So' as propriedades alteradas sao
+    reescritas; as novas entram no fim da regra; regras novas entram no fim do
+    arquivo. Regras repetidas (mesmo seletor) sao fundidas na leitura, como o
+    CSSParser da engine, e continuam separadas na gravacao."""
 
     def __init__(self, path):
         self.path = path
-        self.rules = {}
-        self.raw_blocks = []
+        self.items = []       # str (texto cru) e _Block, na ordem do arquivo
+        self.rules = {}       # seletor -> CSSRule
+        self.exists = os.path.exists(path)
+        self.nl = '\n'
+        self.is_engine_hud = False
+        self._saved = ''
         self._load()
 
+    # -- leitura -----------------------------------------------------------
     def _load(self):
-        if not os.path.exists(self.path):
-            with open(self.path, 'w', encoding='utf-8') as f:
-                f.write("/* Eruption Engine HUD */\n\n")
-            return
-        with open(self.path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        pattern = r'(/\*.*?\*/|\s*([^{}/\s][^{}]*)\s*\{[^}]*\})'
-        pos = 0
-        for m in re.finditer(pattern, content, re.DOTALL):
-            if m.start() > pos:
-                self.raw_blocks.append((None, content[pos:m.start()]))
-            block = m.group(0)
-            selector = m.group(2)
-            if selector:
-                selector = selector.strip()
-                props = self._parse_props(block)
-                self.rules[selector] = CSSRule(selector, props, block)
-                self.raw_blocks.append((selector, block))
-            else:
-                self.raw_blocks.append((None, block))
-            pos = m.end()
-        if pos < len(content):
-            self.raw_blocks.append((None, content[pos:]))
+        content = ''
+        if self.exists:
+            with open(self.path, 'r', encoding='utf-8', newline='') as f:
+                content = f.read()
+        else:
+            content = "/* Criado no Caldera. */\n"
+        self.nl = '\r\n' if '\r\n' in content else '\n'
+        self._parse(content)
+        self._reindex()
+        self._saved = self.serialize()
+        try:
+            same = os.path.realpath(self.path) == os.path.realpath(HUD_CSS_FILE)
+        except OSError:
+            same = False
+        self.is_engine_hud = same or all(s in self.rules for s in ('#hero-panel', '#hero-hp-bar', '#minimap'))
 
-    def _parse_props(self, block):
-        props = {}
-        inner = block[block.find('{') + 1:block.rfind('}')]
-        for line in inner.split(';'):
-            if ':' not in line:
+    def _parse(self, content):
+        items = []
+        raw = []
+        i = 0
+        n = len(content)
+
+        def flush():
+            if raw:
+                items.append(''.join(raw))
+                raw.clear()
+
+        while i < n:
+            c = content[i]
+            if c.isspace():
+                raw.append(c)
+                i += 1
                 continue
-            key, val = line.split(':', 1)
-            key = key.strip()
-            val = val.strip()
-            if key:
-                props[key] = val
-        return props
+            if content.startswith('/*', i):
+                j = _skip_comment(content, i)
+                raw.append(content[i:j])
+                i = j
+                continue
+            # prelude: seletor ou at-rule, ate o '{' (ou ';' / '}' perdido)
+            j = i
+            while j < n and content[j] not in '{;}':
+                if content[j] in '"\'':
+                    j = _skip_string(content, j)
+                elif content.startswith('/*', j):
+                    j = _skip_comment(content, j)
+                else:
+                    j += 1
+            if j >= n or content[j] != '{':
+                end = min(n, j + 1)
+                raw.append(content[i:end])
+                i = end
+                continue
+            k = j + 1
+            depth = 1
+            nested = False
+            while k < n and depth > 0:
+                ch = content[k]
+                if ch in '"\'':
+                    k = _skip_string(content, k)
+                    continue
+                if content.startswith('/*', k):
+                    k = _skip_comment(content, k)
+                    continue
+                if ch == '{':
+                    depth += 1
+                    nested = True
+                elif ch == '}':
+                    depth -= 1
+                k += 1
+            if depth > 0:
+                raw.append(content[i:])
+                i = n
+                break
+            selector = re.sub(r'/\*.*?\*/', '', content[i:j], flags=re.DOTALL).strip()
+            if nested or not selector or selector.startswith('@'):
+                raw.append(content[i:k])   # @media e afins: nao editamos, mas preservamos
+                i = k
+                continue
+            flush()
+            items.append(_Block(selector, content[i:j + 1], self._parse_body(content[j + 1:k - 1]), self.nl))
+            i = k
+        flush()
+        self.items = items
+
+    @staticmethod
+    def _parse_body(body):
+        out = []
+        text = []
+        i = 0
+        n = len(body)
+        while i < n:
+            c = body[i]
+            if c.isspace() or c == ';':
+                text.append(c)
+                i += 1
+                continue
+            if body.startswith('/*', i):
+                j = _skip_comment(body, i)
+                text.append(body[i:j])
+                i = j
+                continue
+            j = i
+            while j < n and body[j] not in ':;':
+                j += 1
+            if j >= n or body[j] == ';':
+                text.append(body[i:j + 1])     # lixo sem ':'; mantem
+                i = j + 1
+                continue
+            key = body[i:j].strip()
+            k = j + 1
+            paren = 0
+            while k < n:
+                ch = body[k]
+                if ch in '"\'':
+                    k = _skip_string(body, k)
+                    continue
+                if body.startswith('/*', k):
+                    k = _skip_comment(body, k)
+                    continue
+                if ch == '(':
+                    paren += 1
+                elif ch == ')':
+                    paren = max(0, paren - 1)
+                elif ch == ';' and paren == 0:
+                    break
+                k += 1
+            end = min(n, k + 1)
+            raw = body[i:end]
+            tail = ''
+            if k >= n:                      # ultima declaracao, sem ';'
+                tail = raw[len(raw.rstrip()):]
+                raw = raw.rstrip()
+            if text:
+                out.append(''.join(text))
+                text = []
+            out.append(_Decl(key, body[j + 1:k].strip(), raw))
+            if tail:
+                text.append(tail)
+            i = end
+        if text:
+            out.append(''.join(text))
+        return out
+
+    def _reindex(self):
+        by_sel = {}
+        for it in self.items:
+            if isinstance(it, _Block):
+                by_sel.setdefault(it.selector, []).append(it)
+        self.rules = {sel: CSSRule(sel, blocks) for sel, blocks in by_sel.items()}
+
+    # -- consulta ----------------------------------------------------------
+    def element_selectors(self):
+        """Regras de id (#algo), na ordem em que aparecem no arquivo."""
+        return [s for s in self.rules if ID_SELECTOR_RE.match(s)]
 
     def get_prop(self, selector, prop):
         rule = self.rules.get(selector)
@@ -597,51 +885,125 @@ class CSSDocument:
             return None
         return rule.properties.get(prop)
 
+    def get_block_text(self, selector):
+        rule = self.rules.get(selector)
+        return "\n".join(b.text() for b in rule.blocks) if rule else ""
+
+    # -- edicao ------------------------------------------------------------
     def set_prop(self, selector, prop, value):
         rule = self.rules.get(selector)
         if not rule:
             return
         if value is None:
+            if prop not in rule.properties:
+                return
+            for b in rule.blocks:
+                b.remove_decl(prop)
             rule.properties.pop(prop, None)
+            return
+        if rule.properties.get(prop) == value:
+            return
+        for b in reversed(rule.blocks):
+            d = b.find(prop)
+            if d is not None:
+                d.value = value
+                break
         else:
-            rule.properties[prop] = value
+            rule.blocks[-1].add_decl(prop, value)
+        rule.properties[prop] = value
 
-    def get_block_text(self, selector):
-        rule = self.rules.get(selector)
+    def add_rule(self, selector, props):
+        """Acrescenta uma regra nova no fim do arquivo, no mesmo formato das
+        demais (4 espacos, uma propriedade por linha). props: lista (chave, valor)."""
+        nl = self.nl
+        text = self.serialize()
+        trailing = len(text) - len(text.rstrip('\r\n'))
+        blank = nl * max(0, 2 - trailing // len(nl)) if text.strip() else ''
+        items = []
+        for k, v in props:
+            items.append(nl + '    ')
+            items.append(_Decl(k, v))
+        items.append(nl)
+        block = _Block(selector, f"{selector} {{", items, nl)
+        if blank:
+            self.items.append(blank)
+        self.items.append(block)
+        self.items.append(nl)
+        self.rules[selector] = CSSRule(selector, [block])
+
+    def remove_rule(self, selector):
+        rule = self.rules.pop(selector, None)
         if not rule:
-            return ""
-        lines = [f"{selector} {{"]
-        for key, val in rule.properties.items():
-            lines.append(f"    {key}: {val};")
-        lines.append("}")
-        return "\n".join(lines)
+            return
+        for block in rule.blocks:
+            idx = self.items.index(block)
+            del self.items[idx]
+            # leva junto as linhas em branco que separavam a regra da proxima
+            if idx < len(self.items) and isinstance(self.items[idx], str):
+                s = self.items[idx]
+                for _ in range(2):
+                    if s.startswith(self.nl):
+                        s = s[len(self.nl):]
+                self.items[idx] = s
+
+    def rename_rule(self, old, new):
+        rule = self.rules.pop(old, None)
+        if not rule:
+            return
+        for b in rule.blocks:
+            b.head = b.head.replace(old, new, 1)
+            b.selector = new
+        rule.selector = new
+        self.rules[new] = rule
+        for sel, r in self.rules.items():
+            p = unquote(r.properties.get('--parent'))
+            if p is not None and p.strip() == old:
+                self.set_prop(sel, '--parent', new)
+
+    # -- gravacao ----------------------------------------------------------
+    def serialize(self):
+        return ''.join(i if isinstance(i, str) else i.text() for i in self.items)
+
+    def is_dirty(self):
+        if not self.exists and not self.rules:
+            return False
+        return self.serialize() != self._saved or not self.exists
 
     def write(self):
-        parts = []
-        seen = set()
-        for selector, text in self.raw_blocks:
-            if selector is None:
-                parts.append(text)
-            else:
-                if selector in seen:
-                    continue
-                seen.add(selector)
-                if parts and not parts[-1].endswith('\n'):
-                    parts.append('\n')
-                parts.append(self.get_block_text(selector))
-                parts.append('\n')
-        for name, selector, _ in EDITABLE_COMPONENTS:
-            if selector not in seen and selector in self.rules:
-                parts.append("\n" + self.get_block_text(selector) + "\n")
-        with open(self.path, 'w', encoding='utf-8') as f:
-            f.write("".join(parts))
+        text = self.serialize()
+        folder = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(folder, exist_ok=True)
+        tmp = self.path + '.caldera-tmp'
+        with open(tmp, 'w', encoding='utf-8', newline='') as f:
+            f.write(text)
+        os.replace(tmp, self.path)
+        for b in (i for i in self.items if isinstance(i, _Block)):
+            for it in b.items:
+                if isinstance(it, _Decl):
+                    it.raw = it.emit()
+                    it.orig = it.value
+        self._saved = text
+        self.exists = True
+
 
 
 class CSSResolver:
-    """Resolve posições de tela a partir das regras CSS, imitando o engine C++."""
+    """Resolve posições de tela a partir das regras CSS, imitando o engine C++.
+
+    Cada elemento tem um pai opcional (--parent: #id); porcentagens valem sobre
+    o retângulo do pai, ou sobre a tela quando não há pai. Elementos presos ao
+    jogador (--bind-to-player: 1) ignoram o pai: left/top são deslocamentos a
+    partir da base do sprite."""
 
     def __init__(self, doc):
         self.doc = doc
+        self.warnings = {}    # mensagem -> True (conjunto que lembra a ordem)
+
+    def begin(self):
+        self.warnings.clear()
+
+    def warn(self, msg):
+        self.warnings[msg] = True
 
     def _get_pct(self, selector, prop, base):
         val = self.doc.get_prop(selector, prop)
@@ -649,22 +1011,85 @@ class CSSResolver:
             return None
         return parse_length(val, base)
 
-    def resolve(self, selector, display_w=VIRTUAL_WIDTH, display_h=VIRTUAL_HEIGHT, _hero=None):
-        is_top = self.is_top_level(selector)
-        hero = _hero
-        if hero is None and not is_top and selector != '#hero-panel':
-            hero = self.resolve_hero_panel(display_w, display_h)
-        elif selector == '#hero-panel':
-            is_top = True
-        base_w = display_w if is_top or hero is None else hero[2]
-        base_h = display_h if is_top or hero is None else hero[3]
+    def is_bound(self, selector):
+        v = self.doc.get_prop(selector, '--bind-to-player')
+        return v is not None and v.strip() == '1'
 
+    def widget_of(self, selector):
+        """Tipo do elemento: --widget, ou text (tem content) / rect (padrão)."""
+        declared = unquote(self.doc.get_prop(selector, '--widget'))
+        if declared is not None:
+            declared = declared.strip().lower()
+            if declared in WIDGET_TYPES:
+                return declared
+            self.warn(f"{selector}: --widget '{declared}' desconhecido (desenhado como rect)")
+            return 'rect'
+        return 'text' if self.doc.get_prop(selector, 'content') is not None else 'rect'
+
+    def declared_parent(self, selector):
+        """O --parent como está escrito (sem validar); no HUD do motor, os
+        widgets antigos sem --parent são filhos do #hero-panel."""
+        raw = self.doc.get_prop(selector, '--parent')
+        if raw is None:
+            if (self.doc.is_engine_hud and selector in LEGACY_HUD_PARENT
+                    and '#hero-panel' in self.doc.rules):
+                return '#hero-panel'
+            return None
+        p = unquote(raw).strip()
+        if p and not p.startswith('#'):
+            p = '#' + p
+        return p or None
+
+    def effective_parent(self, selector):
+        """Pai que vale de verdade: ignora (e avisa) pai inexistente, o próprio
+        elemento e ciclos."""
+        p = self.declared_parent(selector)
+        if p is None:
+            return None
+        if p == selector:
+            self.warn(f"{selector}: --parent aponta para si mesmo (ignorado)")
+            return None
+        if p not in self.doc.rules:
+            self.warn(f"{selector}: pai {p} não existe (ignorado)")
+            return None
+        seen = {selector}
+        cur = p
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            cur = self.declared_parent(cur)
+            if cur == selector:
+                self.warn(f"{selector}: --parent forma um ciclo com {p} (ignorado)")
+                return None
+        return p
+
+    def parent_rect(self, selector, display_w=VIRTUAL_WIDTH, display_h=VIRTUAL_HEIGHT):
+        """Retângulo (x, y, w, h) que serve de base para as % do elemento."""
+        if self.is_bound(selector):
+            return (0.0, 0.0, display_w, display_h)
+        parent = self.effective_parent(selector)
+        if parent is None:
+            return (0.0, 0.0, display_w, display_h)
+        return self.resolve(parent, display_w, display_h)
+
+    def resolve(self, selector, display_w=VIRTUAL_WIDTH, display_h=VIRTUAL_HEIGHT, _depth=0):
+        """Retângulo visual (x, y, w, h) em pixels da tela virtual."""
+        bound = self.is_bound(selector)
+        parent = None if bound or _depth > 64 else self.effective_parent(selector)
+        if parent is not None:
+            pr = self.resolve(parent, display_w, display_h, _depth + 1)
+        else:
+            pr = (0.0, 0.0, display_w, display_h)
+        # pai sem largura/altura (0): o motor cai de volta para a tela
+        base_w = pr[2] if pr[2] > 0 else display_w
+        base_h = pr[3] if pr[3] > 0 else display_h
+
+        # sem width/height o motor fica com 0 (o texto continua desenhando; os outros somem)
         w = self._get_pct(selector, 'width', base_w)
         h = self._get_pct(selector, 'height', base_h)
         if w is None:
-            w = 100.0
+            w = 0.0
         if h is None:
-            h = 100.0
+            h = 0.0
 
         x = 0.0
         y = 0.0
@@ -673,12 +1098,23 @@ class CSSResolver:
         top = self._get_pct(selector, 'top', base_h)
         bottom = self._get_pct(selector, 'bottom', base_h)
 
-        if left is not None:
+        if bound:
+            zoom = PLAYER_ZOOM_SCALE
+            return (PLAYER_POS[0] + (left or 0.0) * zoom, PLAYER_POS[1] + (top or 0.0) * zoom,
+                    w * zoom, h * zoom)
+
+        if left is not None and right is not None:
+            x = left
+            w = base_w - left - right        # left + right esticam o elemento
+        elif left is not None:
             x = left
         elif right is not None:
             x = base_w - right - w
 
-        if top is not None:
+        if top is not None and bottom is not None:
+            y = top
+            h = base_h - top - bottom
+        elif top is not None:
             y = top
         elif bottom is not None:
             y = base_h - bottom - h
@@ -689,29 +1125,37 @@ class CSSResolver:
         if 'translateY(-50%)' in transform or 'translatey(-50%)' in transform:
             y -= h * 0.5
 
-        if not is_top and hero is not None:
-            x += hero[0]
-            y += hero[1]
-
-        return (x, y, w, h)
+        return (x + pr[0], y + pr[1], w, h)
 
     def resolve_hero_panel(self, display_w=VIRTUAL_WIDTH, display_h=VIRTUAL_HEIGHT):
         return self.resolve('#hero-panel', display_w, display_h)
 
-    @staticmethod
-    def is_top_level(selector):
-        for name, sel, top in EDITABLE_COMPONENTS:
-            if sel == selector:
-                return top
-        return True
+
+def _put_len(doc, selector, prop, value_px, base, bound, force=False):
+    """Grava uma medida só se ela mudou de verdade (senão o texto original,
+    com a unidade que o autor escolheu, fica intacto). Devolve True se gravou."""
+    cur = parse_length(doc.get_prop(selector, prop), base)
+    if cur is None and abs(value_px) < 0.05:
+        return False       # sem width/height no CSS e continua sem: nao inventa "0%"
+    if not force and cur is not None and abs(cur - value_px) < 0.05:
+        return False
+    if bound or base <= 0:
+        text = f"{value_px:.1f}px"
+    else:
+        text = to_percent_str(value_px / base)
+    doc.set_prop(selector, prop, text)
+    return True
 
 
 class Component:
-    def __init__(self, name, selector, is_top, z_index=0):
+    def __init__(self, name, selector, z_index=0, file_idx=0):
         self.name = name
         self.selector = selector
-        self.is_top = is_top
         self.z_index = z_index
+        self.file_idx = file_idx
+        self.widget = 'rect'
+        self.widget_declared = None
+        self.parent = None          # pai efetivo (atualizado em update_from_css)
         self.dragging = False
         self.resizing = False
         self.resize_handle = None
@@ -719,96 +1163,162 @@ class Component:
         self.resize_start_mouse = None
         self.offset = (0.0, 0.0)
         self.bind_to_player = False
+        self.align = 'left'
+        self.fx = self.fy = 0.0
+        self.fw = self.fh = 100.0
+        # Caixa de edicao relativa ao retangulo do motor: (dx, dy, w, h). Texto sem
+        # width/height tem o tamanho do proprio texto (o motor desenha no ponto
+        # left/top, alinhado), e os outros tipos ganham um minimo para dar para
+        # clicar. Quando o CSS tem as medidas, a caixa e' o proprio retangulo.
+        self.edit = (0.0, 0.0, 100.0, 100.0)
+
+    @property
+    def is_top(self):
+        return self.parent is None
 
     @property
     def rect(self):
         return pygame.Rect(int(round(self.fx)), int(round(self.fy)),
                            int(round(self.fw)), int(round(self.fh)))
 
-    def screen_rect(self):
-        """Retorna o rect final na tela, considerando bind_to_player e zoom."""
+    def engine_rect(self):
+        """Retângulo que o motor desenha (x, y, w, h), sem arredondar."""
         if self.bind_to_player:
             zoom = PLAYER_ZOOM_SCALE
-            return pygame.Rect(
-                int(round(PLAYER_POS[0] + self.fx * zoom)),
-                int(round(PLAYER_POS[1] + self.fy * zoom)),
-                int(round(self.fw * zoom)),
-                int(round(self.fh * zoom))
-            )
-        return self.rect
+            return (PLAYER_POS[0] + self.fx * zoom, PLAYER_POS[1] + self.fy * zoom,
+                    self.fw * zoom, self.fh * zoom)
+        return (self.fx, self.fy, self.fw, self.fh)
 
-    def update_from_css(self, resolver):
+    def float_rect(self):
+        """Caixa de edicao visual sem arredondar (x, y, w, h): a que se seleciona e arrasta."""
+        x, y, w, h = self.engine_rect()
+        dx, dy, ew, eh = self.edit
+        return (x + dx, y + dy, ew, eh)
+
+    def screen_rect(self):
+        """Caixa de edicao na tela (inteira), considerando bind_to_player e zoom."""
+        x, y, w, h = self.float_rect()
+        return pygame.Rect(int(round(x)), int(round(y)), int(round(w)), int(round(h)))
+
+    def draw_rect(self):
+        """Retângulo do motor, inteiro: o que os widgets desenham."""
+        x, y, w, h = self.engine_rect()
+        return pygame.Rect(int(round(x)), int(round(y)), int(round(w)), int(round(h)))
+
+    def update_edit_box(self, measure):
+        """Recalcula a caixa de edicao (measure(selector) -> (largura, altura) do texto)."""
+        x, y, w, h = self.engine_rect()
+        dx = dy = 0.0
+        ew, eh = w, h
+        if self.widget == 'text' and (w <= 0 or h <= 0) and measure is not None:
+            tw, th = measure(self.selector)
+            if w <= 0:
+                ew = max(tw, 8.0)
+                dx = -ew * 0.5 if self.align == 'center' else (-ew if self.align == 'right' else 0.0)
+            if h <= 0:
+                eh = max(th, 8.0)
+        else:
+            ew = max(w, 12.0) if (w <= 0 or h <= 0) else w
+            eh = max(h, 12.0) if (w <= 0 or h <= 0) else h
+        self.edit = (dx, dy, ew, eh)
+
+    def update_from_css(self, resolver, measure=None):
         doc = resolver.doc
+        sel = self.selector
+        self.parent = resolver.effective_parent(sel)
+        self.bind_to_player = resolver.is_bound(sel)
+        z = doc.get_prop(sel, 'z-index')
+        try:
+            self.z_index = int(float(z)) if z is not None else 0
+        except ValueError:
+            self.z_index = 0
+        self.widget = resolver.widget_of(sel)
+        self.widget_declared = unquote(doc.get_prop(sel, '--widget'))
+        self.align = (unquote(doc.get_prop(sel, 'text-align')) or 'left').strip().lower()
         if self.bind_to_player:
-            left = parse_length(doc.get_prop(self.selector, 'left'), VIRTUAL_WIDTH)
-            top = parse_length(doc.get_prop(self.selector, 'top'), VIRTUAL_HEIGHT)
-            width = parse_length(doc.get_prop(self.selector, 'width'), VIRTUAL_WIDTH)
-            height = parse_length(doc.get_prop(self.selector, 'height'), VIRTUAL_HEIGHT)
+            left = parse_length(doc.get_prop(sel, 'left'), VIRTUAL_WIDTH)
+            top = parse_length(doc.get_prop(sel, 'top'), VIRTUAL_HEIGHT)
+            width = parse_length(doc.get_prop(sel, 'width'), VIRTUAL_WIDTH)
+            height = parse_length(doc.get_prop(sel, 'height'), VIRTUAL_HEIGHT)
             self.fx = float(left if left is not None else 0.0)
             self.fy = float(top if top is not None else 0.0)
-            self.fw = float(width if width is not None else 100.0)
-            self.fh = float(height if height is not None else 100.0)
+            self.fw = float(width if width is not None else 0.0)
+            self.fh = float(height if height is not None else 0.0)
         else:
-            x, y, w, h = resolver.resolve(self.selector)
+            x, y, w, h = resolver.resolve(sel)
             self.fx = float(x)
             self.fy = float(y)
             self.fw = float(w)
             self.fh = float(h)
+        self.update_edit_box(measure)
 
     def set_position(self, abs_x, abs_y, resolver, doc):
+        """Move o elemento para (abs_x, abs_y) na tela virtual. Grava left/top
+        em % do pai (ou em px do sprite, quando preso ao jogador) e só mexe nas
+        propriedades cujo valor mudou."""
+        sel = self.selector
+        # abs_x/abs_y sao a posicao da caixa de edicao; o motor desenha em (x, y)
+        abs_x -= self.edit[0]
+        abs_y -= self.edit[1]
         if self.bind_to_player:
             # abs_x/abs_y são a posição visual na tela; convertemos para offset
             # não-zoomado, igual ao CSS da engine.
             zoom = PLAYER_ZOOM_SCALE
             self.fx = (abs_x - PLAYER_POS[0]) / zoom
             self.fy = (abs_y - PLAYER_POS[1]) / zoom
-            doc.set_prop(self.selector, 'left', f"{self.fx:.1f}px")
-            doc.set_prop(self.selector, 'top', f"{self.fy:.1f}px")
-            doc.set_prop(self.selector, 'right', None)
-            doc.set_prop(self.selector, 'bottom', None)
+            moved = _put_len(doc, sel, 'left', self.fx, VIRTUAL_WIDTH, True)
+            moved |= _put_len(doc, sel, 'top', self.fy, VIRTUAL_HEIGHT, True)
+            if moved:
+                doc.set_prop(sel, 'right', None)
+                doc.set_prop(sel, 'bottom', None)
             # width/height permanecem em pixels absolutos (não-zoomados)
-            doc.set_prop(self.selector, 'width', f"{self.fw:.1f}px")
-            doc.set_prop(self.selector, 'height', f"{self.fh:.1f}px")
+            _put_len(doc, sel, 'width', self.fw, VIRTUAL_WIDTH, True)
+            _put_len(doc, sel, 'height', self.fh, VIRTUAL_HEIGHT, True)
             return
 
-        hero = resolver.resolve_hero_panel()
-        if self.is_top:
-            left_ratio = abs_x / VIRTUAL_WIDTH
-            top_ratio = abs_y / VIRTUAL_HEIGHT
-            width_ratio = self.fw / VIRTUAL_WIDTH
-            height_ratio = self.fh / VIRTUAL_HEIGHT
-            doc.set_prop(self.selector, 'left', to_percent_str(left_ratio))
-            doc.set_prop(self.selector, 'top', to_percent_str(top_ratio))
-            doc.set_prop(self.selector, 'width', to_percent_str(width_ratio))
-            doc.set_prop(self.selector, 'height', to_percent_str(height_ratio))
-            doc.set_prop(self.selector, 'right', None)
-            doc.set_prop(self.selector, 'bottom', None)
-        else:
-            rel_x = abs_x - hero[0]
-            rel_y = abs_y - hero[1]
-            left_ratio = rel_x / hero[2]
-            top_ratio = rel_y / hero[3]
-            width_ratio = self.fw / hero[2]
-            height_ratio = self.fh / hero[3]
-            doc.set_prop(self.selector, 'left', to_percent_str(left_ratio))
-            doc.set_prop(self.selector, 'top', to_percent_str(top_ratio))
-            doc.set_prop(self.selector, 'width', to_percent_str(width_ratio))
-            doc.set_prop(self.selector, 'height', to_percent_str(height_ratio))
-            doc.set_prop(self.selector, 'right', None)
-            doc.set_prop(self.selector, 'bottom', None)
-        # Limpa transform para que left/top sejam interpretados literalmente após mover
-        doc.set_prop(self.selector, 'transform', None)
+        cur = resolver.resolve(sel)
+        if all(abs(a - b) < 0.05 for a, b in zip(cur, (abs_x, abs_y, self.fw, self.fh))):
+            return
+        px, py, pw, ph = resolver.parent_rect(sel)
+        # right/bottom/transform mudam o significado de left/top: ao mover,
+        # reescreve left/top e tira os outros
+        force = any(doc.get_prop(sel, p) for p in ('right', 'bottom', 'transform'))
+        moved = _put_len(doc, sel, 'left', abs_x - px, pw, False, force)
+        moved |= _put_len(doc, sel, 'top', abs_y - py, ph, False, force)
+        if moved:
+            doc.set_prop(sel, 'right', None)
+            doc.set_prop(sel, 'bottom', None)
+            doc.set_prop(sel, 'transform', None)
+        _put_len(doc, sel, 'width', self.fw, pw, False)
+        _put_len(doc, sel, 'height', self.fh, ph, False)
         self.update_from_css(resolver)
 
     def set_size(self, w, h, resolver, doc):
+        """Dá width/height ao elemento (w/h sem o zoom do jogador). A partir daqui a
+        caixa de edicao e' o proprio retangulo, mesmo para texto que nao tinha medidas."""
         self.fw = float(w)
         self.fh = float(h)
+        self.edit = (0.0, 0.0, self.fw, self.fh)
         if self.bind_to_player:
-            doc.set_prop(self.selector, 'width', f"{self.fw:.1f}px")
-            doc.set_prop(self.selector, 'height', f"{self.fh:.1f}px")
-        # Usa a posição visual final para que set_position converta corretamente.
-        rect = self.screen_rect()
-        self.set_position(rect.x, rect.y, resolver, doc)
+            _put_len(doc, self.selector, 'width', self.fw, VIRTUAL_WIDTH, True)
+            _put_len(doc, self.selector, 'height', self.fh, VIRTUAL_HEIGHT, True)
+            return
+        # Usa a posição visual atual (sem arredondar) para não deslocar o elemento.
+        x, y = resolver.resolve(self.selector)[:2]
+        self.set_position(x, y, resolver, doc)   # edit[:2] ja' e' (0, 0)
+
+
+def draw_dashed_rect(surf, color, rect, dash=6):
+    """Contorno tracejado (usado quando a imagem de um elemento nao existe)."""
+    r = pygame.Rect(rect)
+    for x in range(r.left, r.right, dash * 2):
+        x2 = min(x + dash, r.right - 1)
+        pygame.draw.line(surf, color, (x, r.top), (x2, r.top))
+        pygame.draw.line(surf, color, (x, r.bottom - 1), (x2, r.bottom - 1))
+    for y in range(r.top, r.bottom, dash * 2):
+        y2 = min(y + dash, r.bottom - 1)
+        pygame.draw.line(surf, color, (r.left, y), (r.left, y2))
+        pygame.draw.line(surf, color, (r.right - 1, y), (r.right - 1, y2))
 
 
 class CSSRenderer:
@@ -822,6 +1332,10 @@ class CSSRenderer:
         self.small_font = None
         self.images = {}
         self.hero = HeroPreview()
+        self.font_cache = {}
+        self.asset_cache = {}      # (arquivo, mtime) -> Surface (imagens dos elementos)
+        self.scaled_cache = {}
+        self.project_root = None   # raiz do projeto de jogo (para --image)
 
     def set_fonts(self, font, big_font, small_font):
         self.font = font
@@ -1498,6 +2012,197 @@ class CSSRenderer:
             lw, lh = label.get_size()
             surf.blit(label, (int(x + (w - lw) * 0.5), y + h + 2))
 
+    # ------------------------------------------------------------------
+    # Elementos genericos: --widget rect | text | bar | image
+    # ------------------------------------------------------------------
+    def get_font(self, px):
+        px = max(6, int(round(px)))
+        f = self.font_cache.get(px)
+        if f is None:
+            f = pygame.font.SysFont("Arial", px)
+            self.font_cache[px] = f
+        return f
+
+    def font_size_px(self, selector):
+        """font-size em % da ALTURA da tela, ou px."""
+        val = self.doc.get_prop(selector, 'font-size')
+        px = parse_length(val, VIRTUAL_HEIGHT) if val is not None else None
+        return px if px and px > 0 else VIRTUAL_HEIGHT * 0.03
+
+    def num_prop(self, selector, prop, fallback):
+        val = self.doc.get_prop(selector, prop)
+        if val is None:
+            return fallback
+        try:
+            return float(val.strip())
+        except ValueError:
+            return fallback
+
+    def draw_box(self, surf, rect, bg, bc, bw, radius):
+        """Retangulo com fundo, borda e canto, misturando o alfa de verdade
+        (pygame.draw sobre superficie com alfa so' substitui os pixels)."""
+        r = pygame.Rect(int(rect[0]), int(rect[1]), max(1, int(rect[2])), max(1, int(rect[3])))
+        tmp = pygame.Surface(r.size, pygame.SRCALPHA)
+        radius = max(0, min(int(radius), min(r.w, r.h) // 2))
+        if bg and bg[3] > 0:
+            pygame.draw.rect(tmp, bg, tmp.get_rect(), border_radius=radius)
+        if bw > 0 and bc and bc[3] > 0:
+            pygame.draw.rect(tmp, bc, tmp.get_rect(), max(1, int(round(bw))), border_radius=radius)
+        surf.blit(tmp, r.topleft)
+
+    def draw_rect_widget(self, surf, selector, rect):
+        self.draw_box(surf, rect, self.bg(selector, (0, 0, 0, 0)), self.bc(selector, (0, 0, 0, 0)),
+                      self.bw(selector, 0.0), self._rounded_radius(selector))
+
+    def measure_text(self, doc, selector):
+        """Tamanho (largura, altura) do texto do elemento, para a caixa de edicao
+        de um texto sem width/height. Sem content, mede o proprio id."""
+        old = self.doc
+        self.doc = doc
+        try:
+            text = unquote(doc.get_prop(selector, 'content')) or selector
+            font = self.get_font(self.font_size_px(selector))
+            return float(font.size(text)[0]), float(font.get_height())
+        finally:
+            self.doc = old
+
+    def draw_label(self, surf, x, y, text, size, color, align):
+        """Texto com sombra de 1 px, como CSSLayout::drawLabel: (x, y) e' o topo do
+        texto; align 0 esquerda (x = borda), 1 centro, 2 direita (x = borda direita)."""
+        font = self.get_font(size)
+        img = font.render(text, True, color[:3])
+        shadow = font.render(text, True, (0, 0, 0))
+        w = img.get_width()
+        left = x if align == 0 else (x - w * 0.5 if align == 1 else x - w)
+        if color[3] < 255:
+            img.set_alpha(color[3])
+        shadow.set_alpha(int(200 * color[3] / 255))
+        surf.blit(shadow, (int(left) + 1, int(y) + 1))
+        surf.blit(img, (int(left), int(y)))
+
+    def draw_text_widget(self, surf, selector, rect):
+        text = unquote(self.doc.get_prop(selector, 'content')) or ''
+        if TEXT_DRAWS_BACKGROUND:
+            self.draw_rect_widget(surf, selector, rect)
+        if not text:
+            return
+        align = (unquote(self.doc.get_prop(selector, 'text-align')) or 'left').strip().lower()
+        # o motor desenha o texto a partir do TOPO do retangulo (nao centraliza na vertical)
+        if align == 'center':
+            x, a = rect[0] + rect[2] * 0.5, 1
+        elif align == 'right':
+            x, a = rect[0] + rect[2], 2
+        else:
+            x, a = rect[0], 0
+        self.draw_label(surf, x, rect[1], text, self.font_size_px(selector),
+                        self.tc(selector, (230, 230, 230, 255)), a)
+
+    def draw_bar_widget(self, surf, selector, rect):
+        bw = self.bw(selector, 0.0)
+        radius = self._rounded_radius(selector)
+        self.draw_box(surf, rect, self.bg(selector, (0, 0, 0, 0)), self.bc(selector, (0, 0, 0, 0)), bw, radius)
+        ratio = max(0.0, min(1.0, self.num_prop(selector, '--value', 1.0)))
+        fill_w = (rect[2] - 2 * bw) * ratio
+        if fill_w > 0 and rect[3] - 2 * bw > 0:
+            fill = self._color(selector, '--fill-color', self.tc(selector, (220, 220, 220, 255)))
+            self.draw_box(surf, (rect[0] + bw, rect[1] + bw, fill_w, rect[3] - 2 * bw), fill, None, 0, 0)
+        text = unquote(self.doc.get_prop(selector, 'content')) or ''
+        if text:   # texto no centro da barra (o motor desenha o content da barra)
+            val = self.doc.get_prop(selector, 'font-size')
+            size = parse_length(val, VIRTUAL_HEIGHT) if val is not None else None
+            size = size if size and size > 0 else rect[3] * 0.8
+            self.draw_label(surf, rect[0] + rect[2] * 0.5, rect[1] + (rect[3] - size) * 0.5, text, size,
+                            self.tc(selector, (240, 240, 240, 255)), 1)
+
+    def resolve_asset(self, path):
+        """Caminho do --image: relativo a pasta do projeto (ou da engine)."""
+        if os.path.isabs(path):
+            return path if os.path.exists(path) else None
+        roots = [self.project_root, BASE_DIR, os.path.dirname(os.path.abspath(self.doc.path))]
+        for root in roots:
+            if root and os.path.exists(os.path.join(root, path)):
+                return os.path.join(root, path)
+        return None
+
+    def draw_image_widget(self, surf, selector, rect):
+        name = unquote(self.doc.get_prop(selector, '--image')) or ''
+        full = self.resolve_asset(name) if name else None
+        r = pygame.Rect(int(rect[0]), int(rect[1]), max(1, int(rect[2])), max(1, int(rect[3])))
+        img = None
+        if full:
+            try:
+                key = (full, os.path.getmtime(full))
+                src = self.asset_cache.get(key)
+                if src is None:
+                    src = pygame.image.load(full).convert_alpha()
+                    self.asset_cache[key] = src
+                skey = (key, r.w, r.h)
+                img = self.scaled_cache.get(skey)
+                if img is None:
+                    if len(self.scaled_cache) > 200:
+                        self.scaled_cache.clear()
+                    img = pygame.transform.smoothscale(src, r.size)
+                    self.scaled_cache[skey] = img
+            except (pygame.error, OSError):
+                img = None
+        if img is not None:
+            surf.blit(img, r.topleft)
+            return
+        # sem arquivo: retangulo tracejado com o nome, para o layout continuar editavel
+        draw_dashed_rect(surf, (200, 160, 90, 255), r)
+        if self.small_font:
+            label = self.small_font.render(os.path.basename(name) or "(sem --image)", True, (200, 160, 90))
+            surf.blit(label, label.get_rect(center=r.center))
+
+    def draw_generic(self, surf, comp, rect):
+        w = comp.widget
+        if w == 'text':
+            self.draw_text_widget(surf, comp.selector, rect)
+        elif w == 'bar':
+            self.draw_bar_widget(surf, comp.selector, rect)
+        elif w == 'image':
+            self.draw_image_widget(surf, comp.selector, rect)
+        else:
+            self.draw_rect_widget(surf, comp.selector, rect)
+
+    def _draw_body(self, surf, comp, rect):
+        # No HUD do motor, os widgets antigos (sem --widget) continuam com o
+        # desenho proprio; qualquer outro elemento usa os widgets genericos.
+        if self.doc.is_engine_hud and comp.widget_declared is None and comp.selector in LEGACY_HUD_DRAW:
+            self.draw_component(surf, comp.selector, rect)
+        else:
+            self.draw_generic(surf, comp, rect)
+
+    def draw_element(self, surf, comp, rect):
+        """Desenha um elemento respeitando opacity e display: none (que aparece
+        esmaecido, porque quem edita precisa enxergar o que comeca escondido)."""
+        sel = comp.selector
+        hidden = (unquote(self.doc.get_prop(sel, 'display')) or '').strip().lower() == 'none'
+        alpha = max(0.0, min(1.0, self.num_prop(sel, 'opacity', 1.0))) * (0.3 if hidden else 1.0)
+        r = pygame.Rect(rect)
+        if alpha >= 0.999:
+            self._draw_body(surf, comp, r)
+        else:
+            pad = 24
+            tmp = pygame.Surface((r.w + 2 * pad, r.h + 2 * pad), pygame.SRCALPHA)
+            self._draw_body(tmp, comp, pygame.Rect(pad, pad, r.w, r.h))
+            tmp.fill((255, 255, 255, int(alpha * 255)), special_flags=pygame.BLEND_RGBA_MULT)
+            surf.blit(tmp, (r.x - pad, r.y - pad))
+        if hidden and self.small_font:
+            label = self.small_font.render("display: none", True, (255, 200, 90))
+            surf.blit(label, (r.x + 2, r.y + 2))
+        # Texto sem content (o script preenche) e elementos sem width/height nao aparecem
+        # no jogo: o Caldera marca o lugar com um tracejado e o id, so' para quem edita.
+        empty_text = comp.widget == 'text' and not (unquote(self.doc.get_prop(sel, 'content')) or '')
+        no_body = comp.widget != 'text' and (r.w <= 0 or r.h <= 0)
+        if (empty_text or no_body) and self.small_font:
+            box = comp.screen_rect()
+            draw_dashed_rect(surf, (150, 155, 170, 150), box)
+            label = self.small_font.render(sel if empty_text else sel + " (sem width/height)",
+                                           True, (150, 155, 170))
+            surf.blit(label, (box.x + 3, box.y + 1))
+
+
 
     # ------------------------------------------------------------------
     # dispatcher
@@ -1534,28 +2239,51 @@ class CSSRenderer:
 
 
 class HUDState:
-    def __init__(self, doc):
+    """Os elementos do documento (uma regra de id = um elemento), a seleção e
+    as operações de edição: criar, apagar, duplicar, renomear, reparentar e
+    mudar a ordem de desenho (z-index)."""
+
+    def __init__(self, doc, measure=None):
         self.doc = doc
         self.resolver = CSSResolver(doc)
+        self.measure = measure      # medida(seletor) -> (largura, altura) do texto, para a caixa de edicao
         self.components = []
         self.selector_to_component = {}
         self.selected_set = set()
-        for name, selector, is_top in EDITABLE_COMPONENTS:
-            z = 0
-            z_val = doc.get_prop(selector, 'z-index')
-            if z_val is not None:
-                try:
-                    z = int(z_val)
-                except ValueError:
-                    pass
-            comp = Component(name, selector, is_top, z)
-            bind_val = doc.get_prop(selector, '--bind-to-player')
-            comp.bind_to_player = (bind_val is not None and bind_val.strip() == '1')
-            comp.update_from_css(self.resolver)
-            self.components.append(comp)
-            self.selector_to_component[selector] = comp
+        self.sync()
+
+    # -- sincronia com o documento -----------------------------------------
+    def sync(self):
+        """Alinha os componentes com as regras de id do documento."""
+        sels = self.doc.element_selectors()
+        for sel in list(self.selector_to_component):
+            if sel not in sels:
+                comp = self.selector_to_component.pop(sel)
+                self.components.remove(comp)
+                self.selected_set.discard(sel)
+        names = {s: n for n, s, _ in EDITABLE_COMPONENTS} if self.doc.is_engine_hud else {}
+        for idx, sel in enumerate(sels):
+            comp = self.selector_to_component.get(sel)
+            if comp is None:
+                comp = Component(names.get(sel, sel[1:]), sel, 0, idx)
+                self.components.append(comp)
+                self.selector_to_component[sel] = comp
+            comp.file_idx = idx
+        self.refresh_all()
         self.sort_by_z()
 
+    def refresh_all(self):
+        self.resolver.begin()
+        for comp in self.components:
+            comp.update_from_css(self.resolver, self.measure)
+            if len(self.ancestors(comp.selector)) > 4:
+                self.resolver.warn(f"{comp.selector}: mais de 4 níveis de --parent (o motor só segue 4)")
+
+    def sort_by_z(self):
+        # empate no z-index mantém a ordem do arquivo (igual ao motor)
+        self.components.sort(key=lambda c: (c.z_index, c.file_idx))
+
+    # -- seleção ------------------------------------------------------------
     def is_selected(self, selector):
         return selector in self.selected_set
 
@@ -1573,24 +2301,205 @@ class HUDState:
     def clear_selection(self):
         self.selected_set.clear()
 
-    def sort_by_z(self):
-        self.components.sort(key=lambda c: c.z_index)
+    def selected_components(self):
+        return [c for c in self.components if c.selector in self.selected_set]
 
-    def refresh_all(self):
-        for comp in self.components:
-            comp.update_from_css(self.resolver)
+    # -- hierarquia ----------------------------------------------------------
+    def ancestors(self, selector):
+        """Seletores dos pais, do mais próximo ao mais distante."""
+        out = []
+        comp = self.selector_to_component.get(selector)
+        while comp is not None and comp.parent is not None and comp.parent not in out and len(out) < 64:
+            out.append(comp.parent)
+            comp = self.selector_to_component.get(comp.parent)
+        return out
 
+    def depth(self, selector):
+        return len(self.ancestors(selector))
+
+    def children(self, selector):
+        return [c for c in self.components if c.parent == selector]
+
+    # -- gravação -------------------------------------------------------------
     def export_to_css(self):
-        for comp in self.components:
-            self.doc.set_prop(comp.selector, 'z-index', str(comp.z_index))
-            self.doc.set_prop(comp.selector, 'position', 'absolute')
-            self.doc.set_prop(comp.selector, '--bind-to-player', '1' if comp.bind_to_player else '0')
-            # Use a posição visual final (já com zoom aplicado) para que a
-            # conversão de volta para offset em set_position fique correta.
-            rect = comp.screen_rect()
-            comp.set_position(rect.x, rect.y, self.resolver, self.doc)
         self.doc.write()
 
+    # -- criar / apagar / duplicar / renomear -----------------------------------
+    def next_z(self):
+        return max((c.z_index for c in self.components), default=-1) + 1
+
+    def unique_id(self, base):
+        base = re.sub(r'-\d+$', '', base) or 'elemento'
+        n = 1
+        while f"#{base}-{n}" in self.doc.rules:
+            n += 1
+        return f"{base}-{n}"
+
+    def create(self, widget, ident, parent=None):
+        """Cria o elemento #ident (rect | text | bar | image). Sem pai, o
+        retângulo nasce a 10%/10% da tela; com pai, a 5%/5% do pai."""
+        inside = parent is not None
+        x, y = ('5%', '5%') if inside else ('10%', '10%')
+        sizes = {'rect': ('40%', '40%') if inside else ('20%', '20%'),
+                 'text': ('60%', '20%') if inside else ('20%', '6%'),
+                 'bar': ('60%', '15%') if inside else ('20%', '4%'),
+                 'image': ('40%', '40%') if inside else ('10%', '10%')}
+        w, h = sizes[widget]
+        props = {'--widget': widget, 'position': 'absolute', 'left': x, 'top': y,
+                 'width': w, 'height': h, 'z-index': str(self.next_z())}
+        if parent:
+            props['--parent'] = parent
+        if widget == 'rect':
+            props.update({'background-color': '#1a1d24cc', 'border-color': '#3a4152',
+                          'border-width': '1px', 'border-radius': '3px'})
+        elif widget == 'text':
+            props.update({'color': '#e6e6e6', 'font-size': '3%', 'text-align': 'left',
+                          'content': '"Texto"'})
+        elif widget == 'bar':
+            props.update({'background-color': '#1a1d24', '--fill-color': '#d84040',
+                          'border-color': '#3a4152', 'border-width': '1px',
+                          'border-radius': '3px', '--value': '0.75'})
+        else:
+            props['--image'] = '"assets/ui/imagem.png"'
+        self.add_element('#' + ident, list(props.items()))
+        return self.selector_to_component['#' + ident]
+
+    def add_element(self, selector, props):
+        props = sorted(props, key=lambda kv: PROP_ORDER.index(kv[0]) if kv[0] in PROP_ORDER else len(PROP_ORDER))
+        self.doc.add_rule(selector, props)
+        self.sync()
+        self.select_only(selector)
+
+    def duplicate(self, selector):
+        comp = self.selector_to_component.get(selector)
+        rule = self.doc.rules.get(selector)
+        if comp is None or rule is None:
+            return None
+        new_sel = '#' + self.unique_id(selector[1:])
+        props = dict(rule.properties)
+        props['z-index'] = str(self.next_z())
+        x, y = comp.float_rect()[:2]
+        self.add_element(new_sel, list(props.items()))
+        new = self.selector_to_component[new_sel]
+        new.set_position(x + 16.0, y + 16.0, self.resolver, self.doc)
+        self.refresh_all()
+        return new
+
+    def delete(self, selector):
+        """Apaga o elemento. Os filhos sobem para o pai do apagado, sem sair do lugar."""
+        comp = self.selector_to_component.get(selector)
+        if comp is None:
+            return
+        for child in self.children(selector):
+            self.set_parent(child, comp.parent)
+        self.doc.remove_rule(selector)
+        self.sync()
+
+    def rename(self, old, new):
+        comp = self.selector_to_component.pop(old, None)
+        if comp is None:
+            return
+        self.doc.rename_rule(old, new)
+        comp.selector = new
+        if comp.name == old[1:]:
+            comp.name = new[1:]
+        self.selector_to_component[new] = comp
+        if old in self.selected_set:
+            self.selected_set.discard(old)
+            self.selected_set.add(new)
+        self.refresh_all()
+
+    def set_parent(self, comp, new_parent):
+        """Troca o --parent mantendo o elemento onde está na tela. Devolve
+        None se deu certo, ou o motivo da recusa."""
+        sel = comp.selector
+        if new_parent is not None:
+            if new_parent == sel or new_parent in self.get_descendants(sel):
+                return "um elemento não pode ser pai de si mesmo nem de um ancestral"
+            if new_parent not in self.doc.rules:
+                return f"{new_parent} não existe"
+        elif self.doc.get_prop(sel, '--parent') is None and self.resolver.declared_parent(sel):
+            return "o pai dos widgets do HUD do motor é fixo"
+        x, y = comp.float_rect()[:2]
+        w, h = comp.engine_rect()[2:]
+        if new_parent is None:
+            self.doc.set_prop(sel, '--parent', None)
+        else:
+            self.doc.set_prop(sel, '--parent', new_parent)
+        self.refresh_all()
+        if not comp.bind_to_player:
+            comp.fw, comp.fh = w, h
+            comp.set_position(x, y, self.resolver, self.doc)
+        self.refresh_all()
+        return None
+
+    def get_descendants(self, selector):
+        out = []
+        stack = [selector]
+        while stack:
+            cur = stack.pop()
+            for c in self.children(cur):
+                if c.selector not in out:
+                    out.append(c.selector)
+                    stack.append(c.selector)
+        return out
+
+    def cycle_widget(self, comp):
+        order = list(WIDGET_TYPES)
+        nxt = order[(order.index(comp.widget) + 1) % len(order)]
+        self.doc.set_prop(comp.selector, '--widget', nxt)
+        if nxt == 'text' and self.doc.get_prop(comp.selector, 'content') is None:
+            self.doc.set_prop(comp.selector, 'content', '"Texto"')
+        if nxt == 'image' and self.doc.get_prop(comp.selector, '--image') is None:
+            self.doc.set_prop(comp.selector, '--image', '"assets/ui/imagem.png"')
+        if nxt == 'bar' and self.doc.get_prop(comp.selector, '--value') is None:
+            self.doc.set_prop(comp.selector, '--value', '0.75')
+        self.refresh_all()
+        return nxt
+
+    # -- ordem de desenho -------------------------------------------------------
+    def apply_order(self, order):
+        """Reescreve o z-index para que o desenho (z-index, depois ordem do
+        arquivo) siga 'order', do fundo para o topo, mexendo no minimo de
+        elementos: so' sobe (ou so' desce) quem for obrigado, e escolhe o
+        sentido que muda menos propriedades."""
+        zs = [c.z_index for c in order]
+        up = []
+        for c, z in zip(order, zs):      # varre do fundo: sobe quem ficou abaixo do anterior
+            if up:
+                p = order[len(up) - 1]
+                need = up[-1] if c.file_idx > p.file_idx else up[-1] + 1
+                z = max(z, need)
+            up.append(z)
+        down = [0] * len(order)
+        for i in range(len(order) - 1, -1, -1):   # varre do topo: desce quem ficou acima do seguinte
+            z = zs[i]
+            if i < len(order) - 1:
+                nxt = order[i + 1]
+                need = down[i + 1] if order[i].file_idx < nxt.file_idx else down[i + 1] - 1
+                z = min(z, need)
+            down[i] = z
+        changes = lambda new: sum(1 for a, b in zip(new, zs) if a != b)
+        new = up if changes(up) <= changes(down) else down
+        for comp, z in zip(order, new):
+            if comp.z_index != z:
+                self.doc.set_prop(comp.selector, 'z-index', str(z))
+                comp.z_index = z
+        self.sort_by_z()
+
+    def move_z(self, selector, delta):
+        """delta > 0 sobe uma camada (desenha por cima), delta < 0 desce."""
+        order = list(self.components)
+        comp = self.selector_to_component.get(selector)
+        if comp is None:
+            return False
+        i = order.index(comp)
+        j = i + delta
+        if not 0 <= j < len(order):
+            return False
+        order[i], order[j] = order[j], order[i]
+        self.apply_order(order)
+        return True
 
 # ---------------------------------------------------------------------------
 # UI
@@ -1651,43 +2560,63 @@ class ToggleButton(Button):
 
 
 class LayerPanel:
-    def __init__(self, rect, components, state):
+    """Lista de elementos ordenada por z-index (o de cima desenha por cima).
+    Clique seleciona; arrastar reordena; os botões de subir/descer ficam no
+    rodapé e são desenhados pelo main."""
+    HEADER_H = 36
+    FOOTER_H = 124
+
+    def __init__(self, rect, state):
         self.rect = pygame.Rect(rect)
-        self.components = components
         self.state = state
-        self.item_height = 28
+        self.item_height = 24
         self.scroll = 0
         self.selected = None
-        self.dragging_idx = None
+        self.dragging_idx = None    # índices de exibição (0 = topo da lista)
         self.drag_y = 0
         self.drop_target = None
 
-    def _list_start_y(self):
-        return 36
+    @property
+    def components(self):
+        return self.state.components
 
-    def visible_range(self):
-        y = self._list_start_y()
-        visible = (self.rect.h - y) // self.item_height
-        return (self.scroll, min(len(self.components), self.scroll + visible))
+    def display(self):
+        return list(reversed(self.state.components))
+
+    def _list_start_y(self):
+        return self.HEADER_H
+
+    def visible_count(self):
+        return max(1, (self.rect.h - self.HEADER_H - self.FOOTER_H) // self.item_height)
+
+    def clamp_scroll(self):
+        self.scroll = max(0, min(self.scroll, max(0, len(self.components) - self.visible_count())))
+
+    def ensure_visible(self, selector):
+        disp = self.display()
+        for i, c in enumerate(disp):
+            if c.selector == selector:
+                if i < self.scroll:
+                    self.scroll = i
+                elif i >= self.scroll + self.visible_count():
+                    self.scroll = i - self.visible_count() + 1
+                break
+        self.clamp_scroll()
 
     def draw(self, screen, font, header_font):
+        self.clamp_scroll()
         surf = pygame.Surface(self.rect.size, pygame.SRCALPHA)
         surf.fill((20, 22, 26, 245))
         pygame.draw.rect(surf, (139, 90, 43), surf.get_rect(), 2)
-        header = header_font.render("Layers (drag to reorder)", True, (240, 230, 210))
+        header = header_font.render("Elementos (z-index)", True, (240, 230, 210))
         surf.blit(header, (10, 8))
+        disp = self.display()
         y = self._list_start_y()
-        start, end = self.visible_range()
-
-        # linha de drop
-        if self.dragging_idx is not None and self.drop_target is not None:
-            drop_y = y + (self.drop_target - self.scroll) * self.item_height
-            if self.drop_target > self.dragging_idx:
-                drop_y += self.item_height
-            pygame.draw.line(surf, (255, 220, 80), (4, drop_y), (self.rect.w - 4, drop_y), 2)
+        start = self.scroll
+        end = min(len(disp), start + self.visible_count())
 
         for idx in range(start, end):
-            comp = self.components[idx]
+            comp = disp[idx]
             item_rect = pygame.Rect(4, y, self.rect.w - 8, self.item_height - 2)
             is_sel = comp.selector in self.state.selected_set
             if idx == self.dragging_idx:
@@ -1697,18 +2626,33 @@ class LayerPanel:
             else:
                 color = (60, 60, 64)
             pygame.draw.rect(surf, color, item_rect, border_radius=3)
-            pygame.draw.rect(surf, (139, 90, 43), item_rect, 1, border_radius=3)
-            text = font.render(f"{comp.z_index}: {comp.name}", True, (240, 230, 210))
-            surf.blit(text, (item_rect.x + 6, item_rect.y + 5))
+            pygame.draw.rect(surf, (255, 220, 80) if is_sel else (139, 90, 43), item_rect, 1, border_radius=3)
+            indent = min(4, self.state.depth(comp.selector)) * 10
+            label = f"{comp.z_index}: {comp.name}"
+            text = font.render(label, True, (240, 230, 210))
+            surf.blit(text, (item_rect.x + 6 + indent, item_rect.y + 4), (0, 0, item_rect.w - 40 - indent, 20))
+            tag = font.render(comp.widget[0].upper(), True, (150, 160, 175))
+            surf.blit(tag, (item_rect.right - tag.get_width() - 6, item_rect.y + 4))
             y += self.item_height
+
+        # linha de drop
+        if self.dragging_idx is not None and self.drop_target is not None:
+            drop_y = self._list_start_y() + (self.drop_target - self.scroll) * self.item_height
+            if self.drop_target > self.dragging_idx:
+                drop_y += self.item_height
+            pygame.draw.line(surf, (255, 220, 80), (4, drop_y), (self.rect.w - 4, drop_y), 2)
+
+        # rodapé (os botões são desenhados por cima, pelo main)
+        pygame.draw.line(surf, (139, 90, 43), (0, self.rect.h - self.FOOTER_H),
+                         (self.rect.w, self.rect.h - self.FOOTER_H), 1)
         screen.blit(surf, self.rect.topleft)
 
     def item_at(self, pos):
-        x, y = pos[0] - self.rect.x, pos[1] - self.rect.y
+        """Índice de exibição do item sob o mouse (None fora da lista)."""
         if not self.rect.collidepoint(pos):
             return None
-        rel = y - self._list_start_y()
-        if rel < 0:
+        rel = pos[1] - self.rect.y - self._list_start_y()
+        if rel < 0 or rel >= self.visible_count() * self.item_height:
             return None
         idx = self.scroll + rel // self.item_height
         if idx < len(self.components):
@@ -1719,7 +2663,7 @@ class LayerPanel:
         idx = self.item_at(pos)
         if idx is not None:
             self.dragging_idx = idx
-            self.selected = self.components[idx].selector
+            self.selected = self.display()[idx].selector
             self.update_drag(pos)
             return True
         return False
@@ -1727,49 +2671,305 @@ class LayerPanel:
     def update_drag(self, pos):
         if self.dragging_idx is None:
             return
-        x, y = pos[0] - self.rect.x, pos[1] - self.rect.y
+        y = pos[1] - self.rect.y
         self.drag_y = y
         rel = y - self._list_start_y()
         target = self.scroll + max(0, rel // self.item_height)
-        target = min(len(self.components), target)
-        # ajusta para não colocar no mesmo lugar
-        if target > self.dragging_idx:
-            target -= 1
         self.drop_target = max(0, min(len(self.components) - 1, target))
 
     def end_drag(self):
-        if self.dragging_idx is None or self.drop_target is None:
-            self.dragging_idx = None
-            self.drop_target = None
-            return
-        src = self.dragging_idx
-        dst = self.drop_target
-        if src != dst:
-            comp = self.components.pop(src)
-            self.components.insert(dst, comp)
-            # renumera z-index conforme nova ordem
-            for i, c in enumerate(self.components):
-                c.z_index = i
+        """Solta o item arrastrado. Devolve True se a ordem de desenho mudou."""
+        changed = False
+        if self.dragging_idx is not None and self.drop_target is not None \
+                and self.dragging_idx != self.drop_target:
+            disp = self.display()
+            comp = disp.pop(self.dragging_idx)
+            disp.insert(self.drop_target, comp)
+            self.state.apply_order(list(reversed(disp)))
+            changed = True
         self.dragging_idx = None
         self.drop_target = None
-
-    def move_selected(self, delta):
-        # mantido para compatibilidade, mas não usado mais pelas setas
-        if not self.state.selected_set:
-            return
-        sel = self.selected
-        if sel is None:
-            sel = next(iter(self.state.selected_set))
-        for i, comp in enumerate(self.components):
-            if comp.selector == sel:
-                j = i + delta
-                if 0 <= j < len(self.components):
-                    self.components[i], self.components[j] = self.components[j], self.components[i]
-                    self.components[i].z_index, self.components[j].z_index = self.components[j].z_index, self.components[i].z_index
-                break
+        return changed
 
 
-def main():
+class Dialog:
+    """Janelinha modal: um campo de texto, e opcionalmente uma escolha de
+    widget e uma caixa de marcar. on_ok(dialog) devolve None (fecha) ou o
+    texto de um erro (fica aberta e mostra o erro)."""
+
+    def __init__(self, title, label, value='', choices=None, choice_idx=0,
+                 toggle_label=None, toggle=False, on_ok=None, hint='', field=True):
+        self.title = title
+        self.label = label
+        self.value = value
+        self.choices = choices
+        self.choice_idx = choice_idx
+        self.toggle_label = toggle_label
+        self.toggle = toggle
+        self.on_ok = on_ok
+        self.hint = hint
+        self.field = field          # False: so' uma pergunta (Enter confirma)
+        self.error = ''
+        self.rect = pygame.Rect(0, 0, 460, 0)
+        self.choice_rects = []
+        self.toggle_rect = None
+        self.ok_rect = pygame.Rect(0, 0, 0, 0)
+        self.cancel_rect = pygame.Rect(0, 0, 0, 0)
+        self.blink = 0.0
+
+    def layout(self, screen_size):
+        off = 0 if self.field else 44
+        h = 118 - off + (40 if self.choices else 0) + (30 if self.toggle_label else 0) + (18 if self.hint else 0)
+        self.rect = pygame.Rect(0, 0, 460, h)
+        self.rect.center = (screen_size[0] // 2, screen_size[1] // 2)
+        y = self.rect.y + 78 - off + (18 if self.hint else 0)
+        self.choice_rects = []
+        if self.choices:
+            bw = (self.rect.w - 24 - 6 * (len(self.choices) - 1)) // len(self.choices)
+            for i in range(len(self.choices)):
+                self.choice_rects.append(pygame.Rect(self.rect.x + 12 + i * (bw + 6), y, bw, 28))
+            y += 40
+        self.toggle_rect = None
+        if self.toggle_label:
+            self.toggle_rect = pygame.Rect(self.rect.x + 12, y, self.rect.w - 24, 24)
+            y += 30
+        self.ok_rect = pygame.Rect(self.rect.right - 12 - 90 - 6 - 90, self.rect.bottom - 38, 90, 28)
+        self.cancel_rect = pygame.Rect(self.rect.right - 12 - 90, self.rect.bottom - 38, 90, 28)
+
+    def _accept(self):
+        err = self.on_ok(self) if self.on_ok else None
+        if err:
+            self.error = err
+            return None
+        return 'ok'
+
+    def handle_event(self, event, screen_size):
+        self.layout(screen_size)
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                return 'cancel'
+            if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                return self._accept()
+            if event.key == pygame.K_TAB and self.choices:
+                step = -1 if pygame.key.get_mods() & pygame.KMOD_SHIFT else 1
+                self.choice_idx = (self.choice_idx + step) % len(self.choices)
+            elif event.key == pygame.K_BACKSPACE:
+                self.value = self.value[:-1]
+            elif event.unicode and event.unicode.isprintable():
+                self.value += event.unicode
+            self.error = ''
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for i, r in enumerate(self.choice_rects):
+                if r.collidepoint(event.pos):
+                    self.choice_idx = i
+            if self.toggle_rect and self.toggle_rect.collidepoint(event.pos):
+                self.toggle = not self.toggle
+            if self.ok_rect.collidepoint(event.pos):
+                return self._accept()
+            if self.cancel_rect.collidepoint(event.pos):
+                return 'cancel'
+        return None
+
+    def draw(self, screen, font, header_font, screen_size):
+        self.layout(screen_size)
+        shade = pygame.Surface(screen_size, pygame.SRCALPHA)
+        shade.fill((0, 0, 0, 140))
+        screen.blit(shade, (0, 0))
+        pygame.draw.rect(screen, (28, 30, 34), self.rect, border_radius=6)
+        pygame.draw.rect(screen, (139, 90, 43), self.rect, 2, border_radius=6)
+        screen.blit(header_font.render(self.title, True, (240, 230, 210)), (self.rect.x + 12, self.rect.y + 10))
+        y = self.rect.y + 36
+        screen.blit(font.render(self.label, True, (170, 175, 185)), (self.rect.x + 12, y))
+        field = pygame.Rect(self.rect.x + 12, y + 18, self.rect.w - 24, 26)
+        if self.field:
+            pygame.draw.rect(screen, (14, 15, 18), field, border_radius=3)
+            pygame.draw.rect(screen, (255, 220, 80), field, 1, border_radius=3)
+            caret = '|' if int(pygame.time.get_ticks() / 500) % 2 == 0 else ''
+            screen.blit(font.render(self.value + caret, True, (240, 230, 210)), (field.x + 6, field.y + 5))
+        if self.hint:
+            screen.blit(font.render(self.hint, True, (130, 135, 145)), (self.rect.x + 12, field.bottom + 4))
+        for i, r in enumerate(self.choice_rects):
+            on = i == self.choice_idx
+            pygame.draw.rect(screen, (107, 143, 94) if on else (60, 60, 64), r, border_radius=4)
+            pygame.draw.rect(screen, (240, 230, 210), r, 1, border_radius=4)
+            t = font.render(self.choices[i], True, (240, 230, 210))
+            screen.blit(t, t.get_rect(center=r.center))
+        if self.toggle_rect:
+            box = pygame.Rect(self.toggle_rect.x, self.toggle_rect.y + 3, 18, 18)
+            pygame.draw.rect(screen, (60, 60, 64), box, border_radius=3)
+            pygame.draw.rect(screen, (240, 230, 210), box, 1, border_radius=3)
+            if self.toggle:
+                pygame.draw.line(screen, (120, 220, 120), (box.x + 3, box.y + 9), (box.x + 7, box.y + 14), 3)
+                pygame.draw.line(screen, (120, 220, 120), (box.x + 7, box.y + 14), (box.x + 15, box.y + 4), 3)
+            screen.blit(font.render(self.toggle_label, True, (240, 230, 210)), (box.right + 8, box.y + 2))
+        if self.error:
+            screen.blit(font.render(self.error, True, (255, 110, 90)), (self.rect.x + 12, self.rect.bottom - 62))
+        for r, label, col in ((self.ok_rect, "OK (Enter)", (107, 143, 94)), (self.cancel_rect, "Esc", (139, 90, 43))):
+            pygame.draw.rect(screen, col, r, border_radius=4)
+            pygame.draw.rect(screen, (240, 230, 210), r, 1, border_radius=4)
+            t = font.render(label, True, (240, 230, 210))
+            screen.blit(t, t.get_rect(center=r.center))
+
+
+class FileBrowser:
+    """Seletor de arquivo .css dentro do programa (o pygame não tem diálogo
+    nativo). Clique entra na pasta ou abre o arquivo; Esc cancela."""
+
+    def __init__(self, start_dir, ext='.css'):
+        self.ext = ext
+        self.cwd = os.path.abspath(start_dir if os.path.isdir(start_dir) else os.path.expanduser('~'))
+        self.entries = []
+        self.scroll = 0
+        self.hover = 0
+        self.row_h = 24
+        self.rect = pygame.Rect(0, 0, 640, 440)
+        self._scan()
+
+    def _scan(self):
+        names = []
+        try:
+            names = sorted(os.listdir(self.cwd), key=str.lower)
+        except OSError:
+            pass
+        dirs = [(n, True) for n in names if not n.startswith('.') and os.path.isdir(os.path.join(self.cwd, n))]
+        files = [(n, False) for n in names if n.lower().endswith(self.ext) and os.path.isfile(os.path.join(self.cwd, n))]
+        self.entries = [('..', True)] + dirs + files
+        self.scroll = 0
+        self.hover = 0
+
+    def _list_rect(self):
+        return pygame.Rect(self.rect.x + 10, self.rect.y + 62, self.rect.w - 20, self.rect.h - 108)
+
+    def _visible(self):
+        return self._list_rect().h // self.row_h
+
+    def _activate(self, idx):
+        name, is_dir = self.entries[idx]
+        if name == '..':
+            self.cwd = os.path.dirname(self.cwd)
+            self._scan()
+        elif is_dir:
+            self.cwd = os.path.join(self.cwd, name)
+            self._scan()
+        else:
+            return os.path.join(self.cwd, name)
+        return None
+
+    def handle_event(self, event, screen_size):
+        self.rect.center = (screen_size[0] // 2, screen_size[1] // 2)
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                return ('cancel', None)
+            if event.key == pygame.K_UP:
+                self.hover = max(0, self.hover - 1)
+            elif event.key == pygame.K_DOWN:
+                self.hover = min(len(self.entries) - 1, self.hover + 1)
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                path = self._activate(self.hover)
+                if path:
+                    return ('pick', path)
+            elif event.key == pygame.K_BACKSPACE:
+                self.cwd = os.path.dirname(self.cwd)
+                self._scan()
+            self.scroll = max(0, min(self.scroll, self.hover), self.hover - self._visible() + 1)
+        elif event.type == pygame.MOUSEMOTION:
+            lr = self._list_rect()
+            if lr.collidepoint(event.pos):
+                idx = self.scroll + (event.pos[1] - lr.y) // self.row_h
+                if 0 <= idx < len(self.entries):
+                    self.hover = idx
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            lr = self._list_rect()
+            if event.button == 4:
+                self.scroll = max(0, self.scroll - 2)
+            elif event.button == 5:
+                self.scroll = max(0, min(max(0, len(self.entries) - self._visible()), self.scroll + 2))
+            elif event.button == 1 and lr.collidepoint(event.pos):
+                idx = self.scroll + (event.pos[1] - lr.y) // self.row_h
+                if 0 <= idx < len(self.entries):
+                    path = self._activate(idx)
+                    if path:
+                        return ('pick', path)
+            elif event.button == 1 and not self.rect.collidepoint(event.pos):
+                return ('cancel', None)
+        return None
+
+    def draw(self, screen, font, header_font, screen_size):
+        self.rect.center = (screen_size[0] // 2, screen_size[1] // 2)
+        shade = pygame.Surface(screen_size, pygame.SRCALPHA)
+        shade.fill((0, 0, 0, 140))
+        screen.blit(shade, (0, 0))
+        pygame.draw.rect(screen, (28, 30, 34), self.rect, border_radius=6)
+        pygame.draw.rect(screen, (139, 90, 43), self.rect, 2, border_radius=6)
+        screen.blit(header_font.render("Abrir CSS de interface", True, (240, 230, 210)), (self.rect.x + 12, self.rect.y + 10))
+        shown = self.cwd
+        while shown and font.size(shown)[0] > self.rect.w - 24:
+            shown = shown[2:]
+        screen.blit(font.render(('...' + shown) if shown != self.cwd else shown, True, (170, 175, 185)),
+                    (self.rect.x + 12, self.rect.y + 38))
+        lr = self._list_rect()
+        pygame.draw.rect(screen, (14, 15, 18), lr)
+        for i in range(self.scroll, min(len(self.entries), self.scroll + self._visible())):
+            name, is_dir = self.entries[i]
+            row = pygame.Rect(lr.x, lr.y + (i - self.scroll) * self.row_h, lr.w, self.row_h)
+            if i == self.hover:
+                pygame.draw.rect(screen, (60, 60, 70), row)
+            label = (name + '/') if is_dir else name
+            col = (230, 200, 120) if is_dir else (240, 230, 210)
+            screen.blit(font.render(label, True, col), (row.x + 8, row.y + 4))
+        screen.blit(font.render("Clique ou Enter abre; Backspace sobe uma pasta; Esc cancela", True, (130, 135, 145)),
+                    (self.rect.x + 12, self.rect.bottom - 30))
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        prog='caldera',
+        description='Caldera: editor visual de interface em CSS da Eruption Engine. '
+                    'Sem argumentos, abre o HUD do motor (data/hud/default.css).')
+    ap.add_argument('--css', metavar='ARQUIVO',
+                    help='abre este .css de interface (HUD do motor ou do projeto de jogo)')
+    ap.add_argument('--project', metavar='PASTA',
+                    help='pasta do projeto de jogo (a que tem project.eruption): lista os .css de '
+                         'assets/ui/ em abas e resolve --image a partir dela')
+    return ap.parse_args(argv)
+
+
+def find_project_root(start):
+    """Sobe a partir de 'start' ate achar uma pasta com project.eruption."""
+    d = os.path.abspath(start if os.path.isdir(start) else os.path.dirname(start))
+    for _ in range(10):
+        if os.path.exists(os.path.join(d, 'project.eruption')):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def project_ui_files(root):
+    """Os .css de <projeto>/assets/ui/, em ordem alfabetica."""
+    if not root:
+        return []
+    return sorted(glob.glob(os.path.join(root, 'assets', 'ui', '*.css')))
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    project_root = None
+    if args.project:
+        project_root = os.path.abspath(os.path.expanduser(args.project))
+        if not os.path.isdir(project_root):
+            sys.exit(f"caldera: --project: '{args.project}' não é uma pasta")
+    start_css = os.path.abspath(os.path.expanduser(args.css)) if args.css else None
+    if start_css is None and project_root:
+        files = project_ui_files(project_root)
+        start_css = files[0] if files else os.path.join(project_root, 'assets', 'ui', 'novo.css')
+    if start_css is None:
+        start_css = HUD_CSS_FILE
+    elif project_root is None:
+        project_root = find_project_root(start_css)
+
     pygame.init()
 
     screen_width = 1280
@@ -1783,7 +2983,7 @@ def main():
         except ValueError:
             pass
     screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
-    pygame.display.set_caption("Caldera HUD Designer - Eruption Engine")
+    pygame.display.set_caption("Caldera - Eruption Engine")
 
     font = pygame.font.SysFont("Arial", 14, bold=True)
     header_font = pygame.font.SysFont("Arial", 16, bold=True)
@@ -1791,8 +2991,15 @@ def main():
     big_font = pygame.font.SysFont("Arial", 24, bold=True)
     small_font = pygame.font.SysFont("Arial", 12, bold=True)
 
-    doc = CSSDocument(HUD_CSS_FILE)
+    # Documentos abertos nesta sessao: caminho -> (CSSDocument, HUDState). Trocar
+    # de aba nao perde a edicao de quem ficou para tras.
+    open_docs = {}
+    doc = CSSDocument(start_css)
     state = HUDState(doc)
+    open_docs[os.path.abspath(start_css)] = (doc, state)
+
+    def make_state(d):
+        return HUDState(d, measure=lambda sel: renderer.measure_text(d, sel))
 
     scale_x = 1.0
     scale_y = 1.0
@@ -1807,6 +3014,10 @@ def main():
     lock_layer_order = True
     message = ""
     message_timer = 0
+    quit_warned = False   # avisou que ha alteracoes nao gravadas; fechar de novo sai
+    modal = None          # Dialog ou FileBrowser aberto (captura o teclado e o mouse)
+    show_help = False
+    show_player = False   # forca o boneco do preview em documentos sem widget preso ao jogador
     overhead_arc_rotation = 0  # rotação do arco em graus (0, 90, 180, 270)
     debug_dist_timer = 0.0
 
@@ -1855,21 +3066,50 @@ def main():
     def adjust_pitch(delta):
         return set_pitch(player_pitch + delta)
 
-    rot_val = doc.get_prop('#overhead-hp-sp', '--arc-rotation')
-    if rot_val is not None:
-        try:
-            overhead_arc_rotation = int(float(rot_val.strip()))
-        except ValueError:
-            pass
+    def read_arc_rotation():
+        nonlocal overhead_arc_rotation
+        rot_val = doc.get_prop('#overhead-hp-sp', '--arc-rotation')
+        if rot_val is not None:
+            try:
+                overhead_arc_rotation = int(float(rot_val.strip()))
+            except ValueError:
+                pass
+
+    read_arc_rotation()
 
     top_bar_height = 36
+    tabs_bar_height = 26
     menu_full_height = 64
 
+    tab_cache = {'key': None, 'stamp': 0.0, 'paths': []}
+
+    def tab_paths():
+        """Abas: os .css de assets/ui/ do projeto e os demais abertos na sessao.
+        (A lista do disco e' relida a cada meio segundo, nao a cada consulta.)"""
+        key = (len(open_docs), os.path.abspath(doc.path))
+        now = pygame.time.get_ticks()
+        if tab_cache['key'] == key and now - tab_cache['stamp'] < 500:
+            return tab_cache['paths']
+        paths = [os.path.abspath(p) for p in project_ui_files(project_root)]
+        for p in open_docs:
+            if p not in paths:
+                paths.append(p)
+        # abre sempre o que esta em edicao, mesmo que ainda nao exista em disco
+        cur = os.path.abspath(doc.path)
+        if cur not in paths:
+            paths.append(cur)
+        tab_cache.update(key=key, stamp=now, paths=paths)
+        return paths
+
+    def chrome_h():
+        """Altura da barra de cima + faixa de abas (so' aparece com mais de um documento)."""
+        return top_bar_height + (tabs_bar_height if len(tab_paths()) > 1 else 0)
+
     def menu_y():
-        return top_bar_height + menu_height
+        return chrome_h() + menu_height
 
     def layer_w():
-        return 180 if show_layers else 0
+        return 210 if show_layers else 0
 
     def available_area_rect():
         return pygame.Rect(0, menu_y(), screen_width - layer_w(), screen_height - menu_y())
@@ -1888,7 +3128,7 @@ def main():
         lw = layer_w()
         return pygame.Rect(screen_width - lw, menu_y(), lw, screen_height - menu_y())
 
-    layer_panel = LayerPanel(layer_panel_rect(), state.components, state)
+    layer_panel = LayerPanel(layer_panel_rect(), state)
 
     def to_design(rect):
         """Converte rect virtual para coordenadas relativas à área de design."""
@@ -1911,15 +3151,29 @@ def main():
         design = design_area_rect()
         return (x - design.left) / scale_x, (y - design.top) / scale_y
 
-    def export():
-        state.export_to_css()
-        # Sincroniza rotação do arco overhead
-        state.doc.set_prop('#overhead-hp-sp', '--arc-rotation', str(overhead_arc_rotation))
-        state.doc.write()
-
+    def notify(text, frames=180):
         nonlocal message, message_timer
-        message = "Exportado para data/hud/default.css"
-        message_timer = 180
+        message = text
+        message_timer = frames
+
+    def doc_label(path):
+        """Caminho curto para mostrar na tela (relativo ao projeto ou a engine)."""
+        for root in (project_root, BASE_DIR):
+            if root:
+                rel = os.path.relpath(path, root)
+                if not rel.startswith('..'):
+                    return rel
+        return path
+
+    def export():
+        nonlocal quit_warned
+        try:
+            state.export_to_css()
+        except OSError as e:
+            notify(f"Não gravou {os.path.basename(doc.path)}: {e}", 300)
+            return
+        quit_warned = False
+        notify(f"Gravado em {doc_label(doc.path)}")
 
     def toggle_menu():
         nonlocal menu_open, target_menu_height
@@ -1945,6 +3199,9 @@ def main():
             "#skill-slots":  (815.0, 892.0, 290.0, 52.0),
             "#minimap":      (1656.0, 816.0, 240.0, 240.0),
         }
+        if not doc.is_engine_hud:
+            notify("Reset to defaults só vale para o HUD do motor")
+            return
         for comp in state.components:
             if comp.selector in defaults:
                 x, y, w, h = defaults[comp.selector]
@@ -1952,11 +3209,13 @@ def main():
                 comp.fh = h
                 comp.set_position(x, y, state.resolver, state.doc)
         state.sort_by_z()
-        layer_panel.components = state.components
 
     renderer = CSSRenderer(doc, 1.0)
+    renderer.project_root = project_root
     renderer.set_fonts(font, big_font, small_font)
     renderer.load_images()
+    state.measure = lambda sel, _d=doc: renderer.measure_text(_d, sel)
+    state.refresh_all()
 
     def update_scale():
         nonlocal scale_x, scale_y
@@ -1987,19 +3246,24 @@ def main():
             if active == comp.bind_to_player:
                 continue
             # Captura a posição visual ANTES de mudar o modo (o significado de fx/fy muda)
-            visual_x = comp.screen_rect().x
-            visual_y = comp.screen_rect().y
+            visual_x, visual_y, visual_w, visual_h = comp.engine_rect()
             comp.bind_to_player = active
+            if doc.get_prop(comp.selector, '--bind-to-player') is not None or active:
+                state.doc.set_prop(comp.selector, '--bind-to-player', '1' if active else '0')
             if active:
                 # HUD -> Player: offset = posicao_atual - PLAYER_POS
                 comp.fx = visual_x - PLAYER_POS[0]
                 comp.fy = visual_y - PLAYER_POS[1]
+                comp.fw = visual_w / PLAYER_ZOOM_SCALE
+                comp.fh = visual_h / PLAYER_ZOOM_SCALE
             else:
                 # Player -> HUD: posicao = PLAYER_POS + offset
                 comp.fx = visual_x
                 comp.fy = visual_y
+                comp.fw = visual_w
+                comp.fh = visual_h
             # Atualiza CSS imediatamente para refletir o novo espaço
-            comp.set_position(visual_x, visual_y, state.resolver, state.doc)
+            comp.set_position(*comp.float_rect()[:2], state.resolver, state.doc)
 
     def rotate_overhead_arc():
         nonlocal overhead_arc_rotation
@@ -2012,15 +3276,36 @@ def main():
     btn_lock = ToggleButton("Lock", (272, 6, 80, 24), lock_layer_order, set_lock_layer_order)
     btn_snap = ToggleButton("Snap", (screen_width - layer_w() - 8 - 90, 6, 80, 24), snap_enabled, set_snap)
     btn_grid = ToggleButton("Grid", (screen_width - layer_w() - 8 - 180, 6, 80, 24), True, lambda v: set_grid(v))
+    btn_open = Button("Open", (360, 6, 80, 24), lambda: open_browser())
+    btn_player = ToggleButton("Player", (448, 6, 80, 24), show_player, lambda v: set_show_player(v))
 
-    btn_export_menu = Button("Export to default.css", (8, top_bar_height + 8, 180, 32), export)
+    btn_export_menu = Button("Export", (8, top_bar_height + 8, 180, 32), export)
     btn_reset = Button("Reset to defaults", (196, top_bar_height + 8, 140, 32), reset_defaults)
     btn_snap_menu = ToggleButton(f"Snap grid ({grid_size}px)", (344, top_bar_height + 8, 140, 32), snap_enabled, set_snap)
     btn_layers_menu = ToggleButton("Layers panel (L)", (492, top_bar_height + 8, 140, 32), show_layers, lambda v: toggle_layers())
     btn_lock_menu = ToggleButton("Lock layer order (K)", (640, top_bar_height + 8, 160, 32), lock_layer_order, set_lock_layer_order)
+    btn_newcss_menu = Button("New .css (Ctrl+N)", (808, top_bar_height + 8, 150, 32), lambda: open_new_document_dialog())
 
-    buttons = [btn_export, btn_menu, btn_layers, btn_lock, btn_snap, btn_grid]
-    menu_buttons = [btn_export_menu, btn_reset, btn_snap_menu, btn_layers_menu, btn_lock_menu]
+    buttons = [btn_export, btn_menu, btn_layers, btn_lock, btn_open, btn_player, btn_snap, btn_grid]
+    menu_buttons = [btn_export_menu, btn_reset, btn_snap_menu, btn_layers_menu, btn_lock_menu, btn_newcss_menu]
+
+    # Rodape do painel de elementos: criar / duplicar / apagar / renomear e subir / descer.
+    btn_new = Button("New (N)", (0, 0, 92, 24), lambda: open_new_element_dialog())
+    btn_dup = Button("Dup (Ctrl+D)", (0, 0, 92, 24), lambda: duplicate_selected())
+    btn_del = Button("Delete (Del)", (0, 0, 92, 24), lambda: delete_selected())
+    btn_ren = Button("Rename (F2)", (0, 0, 92, 24), lambda: open_rename_dialog())
+    btn_up = Button("Up (+z)", (0, 0, 92, 24), lambda: move_selected_z(1))
+    btn_down = Button("Down (-z)", (0, 0, 92, 24), lambda: move_selected_z(-1))
+    btn_parent = Button("Parent (R)", (0, 0, 92, 24), lambda: open_parent_dialog())
+    btn_text = Button("Text (T)", (0, 0, 92, 24), lambda: open_content_dialog())
+    panel_buttons = [btn_new, btn_dup, btn_del, btn_ren, btn_up, btn_down, btn_parent, btn_text]
+
+    def layout_panel_buttons():
+        pr = layer_panel.rect
+        base_y = pr.bottom - LayerPanel.FOOTER_H + 6
+        for i, b in enumerate(panel_buttons):
+            col, row = i % 2, i // 2
+            b.rect.topleft = (pr.x + 8 + col * 98, base_y + row * 28)
 
     def _get_selected_bind_mode():
         targets = [c for c in state.components if c.selector in state.selected_set]
@@ -2047,6 +3332,202 @@ def main():
         show_grid = value
         btn_grid.active = value
 
+    # ------------------------------------------------------------------
+    # Documentos e edicao de elementos (criar, apagar, duplicar, renomear...)
+    # ------------------------------------------------------------------
+    def set_show_player(value):
+        nonlocal show_player
+        show_player = value
+        btn_player.active = value
+
+    def switch_document(path):
+        """Abre (ou volta para) um .css; a edicao dos outros fica guardada na sessao."""
+        nonlocal doc, state
+        path = os.path.abspath(path)
+        entry = open_docs.get(path)
+        if entry is None:
+            try:
+                d = CSSDocument(path)
+            except (OSError, UnicodeDecodeError) as e:
+                notify(f"Não abriu {os.path.basename(path)}: {e}", 300)
+                return False
+            entry = (d, make_state(d))
+            open_docs[path] = entry
+        doc, state = entry
+        renderer.doc = doc
+        layer_panel.state = state
+        layer_panel.scroll = 0
+        layer_panel.selected = None
+        layer_panel.dragging_idx = None
+        for c in state.components:
+            c.dragging = c.resizing = False
+        read_arc_rotation()
+        pygame.display.set_caption(f"Caldera - {doc_label(doc.path)}")
+        notify(f"Aberto: {doc_label(doc.path)}" + ("" if doc.exists else " (novo, ainda não gravado)"))
+        return True
+
+    def reload_document(force=False):
+        nonlocal doc, state
+        if doc.is_dirty() and not force:
+            notify("Há alterações não gravadas (Shift+F5 descarta e recarrega)", 240)
+            return
+        path = os.path.abspath(doc.path)
+        open_docs.pop(path, None)
+        sel = set(state.selected_set)
+        switch_document(path)
+        state.selected_set = {x for x in sel if x in state.selector_to_component}
+
+    def open_browser():
+        nonlocal modal
+        start = os.path.join(project_root, 'assets', 'ui') if project_root else os.path.dirname(os.path.abspath(doc.path))
+        if not os.path.isdir(start):
+            start = os.path.dirname(os.path.abspath(doc.path))
+        modal = FileBrowser(start)
+
+    def open_new_document_dialog():
+        nonlocal modal
+
+        def ok(dlg):
+            name = dlg.value.strip()
+            if not name or '/' in name or '\\' in name:
+                return "Use só o nome do arquivo (ex.: menu.css)"
+            if not name.lower().endswith('.css'):
+                name += '.css'
+            folder = os.path.join(project_root, 'assets', 'ui') if project_root else os.path.dirname(os.path.abspath(doc.path))
+            switch_document(os.path.join(folder, name))
+            return None
+        modal = Dialog("Novo documento .css", "nome do arquivo", "novo.css", on_ok=ok,
+                       hint="Só é gravado em disco quando você exportar")
+
+    def validate_id(ident, allow=None):
+        if not re.match(r'^[A-Za-z_][\w-]*$', ident):
+            return "id inválido (letras, números, - e _; não começa com número)"
+        if '#' + ident in doc.rules and '#' + ident != allow:
+            return f"#{ident} já existe"
+        return None
+
+    def open_new_element_dialog():
+        nonlocal modal
+        sel = list(state.selected_set)
+        parent_sel = sel[0] if len(sel) == 1 else None
+
+        def ok(dlg):
+            ident = dlg.value.strip().lstrip('#')
+            err = validate_id(ident)
+            if err:
+                return err
+            widget = WIDGET_TYPES[dlg.choice_idx]
+            comp = state.create(widget, ident, parent_sel if dlg.toggle else None)
+            layer_panel.ensure_visible(comp.selector)
+            notify(f"Criado {comp.selector} ({widget})")
+            return None
+        modal = Dialog("Novo elemento", "id (sem #)", state.unique_id('elemento'),
+                       choices=list(WIDGET_TYPES), choice_idx=0,
+                       toggle_label=(f"Dentro de {parent_sel} (--parent)" if parent_sel else None),
+                       toggle=bool(parent_sel), on_ok=ok, hint="Tab troca o tipo (--widget)")
+
+    def duplicate_selected():
+        sels = [c.selector for c in state.selected_components()]
+        if not sels:
+            notify("Selecione um elemento para duplicar")
+            return
+        new = [state.duplicate(sel).selector for sel in sels]
+        state.selected_set = set(new)
+        layer_panel.ensure_visible(new[-1])
+        notify("Duplicado: " + ", ".join(new))
+
+    def delete_selected():
+        nonlocal modal
+        sels = [c.selector for c in state.selected_components()]
+        if not sels:
+            notify("Selecione um elemento para apagar")
+            return
+
+        def ok(dlg):
+            for sel in sels:
+                state.delete(sel)
+            state.clear_selection()
+            notify("Apagado: " + ", ".join(sels))
+            return None
+        names = ", ".join(sels) if len(sels) <= 3 else f"{len(sels)} elementos"
+        modal = Dialog("Apagar elemento", f"Apagar {names}? Os filhos sobem para o pai.", field=False, on_ok=ok,
+                       hint="Não há desfazer; só vale no disco depois de exportar")
+
+    def open_rename_dialog():
+        nonlocal modal
+        sels = [c.selector for c in state.selected_components()]
+        if len(sels) != 1:
+            notify("Selecione um único elemento para renomear")
+            return
+        old = sels[0]
+
+        def ok(dlg):
+            ident = dlg.value.strip().lstrip('#')
+            if '#' + ident == old:
+                return None
+            err = validate_id(ident, allow=old)
+            if err:
+                return err
+            state.rename(old, '#' + ident)
+            notify(f"{old} -> #{ident} (os --parent que apontavam para ele foram atualizados)")
+            return None
+        modal = Dialog("Renomear id", f"novo id para {old}", old[1:], on_ok=ok)
+
+    def move_selected_z(delta):
+        sels = state.selected_components()
+        if len(sels) != 1:
+            notify("Selecione um único elemento para mudar o z-index")
+            return
+        if state.move_z(sels[0].selector, delta):
+            layer_panel.ensure_visible(sels[0].selector)
+            notify(f"{sels[0].selector}: z-index {sels[0].z_index}", 90)
+
+    def open_parent_dialog():
+        nonlocal modal
+        sels = state.selected_components()
+        if len(sels) != 1:
+            notify("Selecione um único elemento para mudar o pai")
+            return
+        comp = sels[0]
+
+        def ok(dlg):
+            text = dlg.value.strip()
+            parent = ('#' + text.lstrip('#')) if text else None
+            err = state.set_parent(comp, parent)
+            if err:
+                return err
+            notify(f"{comp.selector}: pai = {parent or 'tela'}")
+            return None
+        modal = Dialog("Pai do elemento (--parent)", f"id do pai de {comp.selector} (vazio = a tela)",
+                       (comp.parent or ''), on_ok=ok,
+                       hint="O elemento continua no mesmo lugar; as % passam a valer sobre o pai")
+
+    def open_content_dialog():
+        nonlocal modal
+        sels = state.selected_components()
+        if len(sels) != 1:
+            notify("Selecione um único elemento")
+            return
+        comp = sels[0]
+        prop = '--image' if comp.widget == 'image' else 'content'
+        label = "arquivo da imagem (--image, relativo ao projeto)" if prop == '--image' else "texto (content)"
+
+        def ok(dlg):
+            v = dlg.value.replace('\\', '/' if prop == '--image' else '\\').replace('"', '\\"')
+            state.doc.set_prop(comp.selector, prop, f'"{v}"')
+            return None
+        modal = Dialog(f"{comp.selector}", label, unquote(doc.get_prop(comp.selector, prop)) or '', on_ok=ok)
+
+    def cycle_selected_widget():
+        sels = state.selected_components()
+        if not sels:
+            notify("Selecione um elemento")
+            return
+        for c in sels:
+            nxt = state.cycle_widget(c)
+        notify(f"--widget: {nxt}", 90)
+
+
     def draw_guide_line(surf, p1, p2, color=(255, 60, 60, 255), dash=6):
         x1, y1 = int(p1[0]), int(p1[1])
         x2, y2 = int(p2[0]), int(p2[1])
@@ -2065,6 +3546,11 @@ def main():
                 pygame.draw.line(surf, color, (x, y1), (x + seg, y2), 1)
                 x += dash * 2
 
+    def player_visible():
+        """O boneco so' aparece onde ele serve: HUD do motor, widget preso ao
+        jogador, ou o botao Player."""
+        return doc.is_engine_hud or show_player or any(c.bind_to_player for c in state.components)
+
     def draw_guide_label(surf, text, pos, color=(255, 220, 80, 255), bg=(0, 0, 0, 180)):
         ts = font.render(text, True, color)
         tr = ts.get_rect(center=(int(pos[0]), int(pos[1])))
@@ -2080,12 +3566,8 @@ def main():
         if target is None:
             return
         design = design_area_rect()
-        hero = state.resolver.resolve_hero_panel()
-        # Para bind_to_player o espaço de coordenadas é a tela virtual
-        base_w = VIRTUAL_WIDTH if (target.bind_to_player or target.is_top) else hero[2]
-        base_h = VIRTUAL_HEIGHT if (target.bind_to_player or target.is_top) else hero[3]
-        origin_x = 0.0 if (target.bind_to_player or target.is_top) else hero[0]
-        origin_y = 0.0 if (target.bind_to_player or target.is_top) else hero[1]
+        # As distancias valem em % do pai (ou da tela, sem pai ou preso ao jogador)
+        origin_x, origin_y, base_w, base_h = state.resolver.parent_rect(target.selector)
 
         tr = target.screen_rect()
         x, y, w, h = tr.x, tr.y, tr.w, tr.h
@@ -2212,7 +3694,10 @@ def main():
 
         # ------------------------------------------------------------------
         # Player distance guides: distance from player to nearest objects/edges
+        # (so' onde o boneco aparece)
         # ------------------------------------------------------------------
+        if not player_visible():
+            return
         px, py = PLAYER_POS
         base_w = VIRTUAL_WIDTH
         base_h = VIRTUAL_HEIGHT
@@ -2342,6 +3827,18 @@ def main():
             pygame.draw.rect(surf, (255, 220, 80), rect)
             pygame.draw.rect(surf, (0, 0, 0), rect, 1)
 
+    def clamp_position(comp, nx, ny, w, h):
+        """Limita a posicao visual: preso ao jogador, +-500 px em volta do sprite;
+        sem pai, dentro da tela; com pai, ate uma tela de distancia do pai."""
+        if comp.bind_to_player:
+            return (max(PLAYER_POS[0] - 500.0, min(PLAYER_POS[0] + 500.0, nx)),
+                    max(PLAYER_POS[1] - 500.0, min(PLAYER_POS[1] + 500.0, ny)))
+        if comp.is_top:
+            return (max(0.0, min(VIRTUAL_WIDTH - w, nx)), max(0.0, min(VIRTUAL_HEIGHT - h, ny)))
+        px, py, pw, ph = state.resolver.parent_rect(comp.selector)
+        return (max(px - VIRTUAL_WIDTH, min(px + pw + VIRTUAL_WIDTH - w, nx)),
+                max(py - VIRTUAL_HEIGHT, min(py + ph + VIRTUAL_HEIGHT - h, ny)))
+
     def apply_resize(comp, handle, mx, my):
         """Calcula novo rect baseado no handle arrastado."""
         sx, sy, sw, sh = comp.resize_start_rect
@@ -2379,15 +3876,13 @@ def main():
             nh = min_size
 
         # clamp na posição visual
-        if comp.is_top:
-            nx = max(0.0, min(VIRTUAL_WIDTH - nw, nx))
-            ny = max(0.0, min(VIRTUAL_HEIGHT - nh, ny))
-        else:
-            hero = state.resolver.resolve_hero_panel()
-            nx = max(hero[0] - VIRTUAL_WIDTH, min(hero[0] + hero[2] + VIRTUAL_WIDTH - nw, nx))
-            ny = max(hero[1] - VIRTUAL_HEIGHT, min(hero[1] + hero[3] + VIRTUAL_HEIGHT - nh, ny))
+        nx, ny = clamp_position(comp, nx, ny, nw, nh)
 
-        comp.set_size(nw, nh, state.resolver, state.doc)
+        if comp.bind_to_player:
+            # o handle trabalha em pixels visuais; o CSS guarda o tamanho sem o zoom
+            comp.set_size(nw / PLAYER_ZOOM_SCALE, nh / PLAYER_ZOOM_SCALE, state.resolver, state.doc)
+        else:
+            comp.set_size(nw, nh, state.resolver, state.doc)
         comp.set_position(nx, ny, state.resolver, state.doc)
 
     def nudge_selected(dx, dy, resize=False):
@@ -2407,22 +3902,14 @@ def main():
                 target.set_size(nw, nh, state.resolver, state.doc)
                 continue
 
+            # Filho de quem tambem esta selecionado anda junto com o pai (as % dele sao do pai)
+            if any(a in state.selected_set for a in state.ancestors(target.selector)):
+                continue
             # Usa posição visual atual e aplica o nudge; set_position converte para o espaço correto
-            r = target.screen_rect()
-            nx = r.x + dx
-            ny = r.y + dy
-            if target.bind_to_player:
-                # Clamp do offset em ±500px (limite arbitrário de segurança)
-                nx = max(PLAYER_POS[0] - 500.0, min(PLAYER_POS[0] + 500.0, nx))
-                ny = max(PLAYER_POS[1] - 500.0, min(PLAYER_POS[1] + 500.0, ny))
-            elif target.is_top:
-                nx = max(0.0, min(VIRTUAL_WIDTH - target.fw, nx))
-                ny = max(0.0, min(VIRTUAL_HEIGHT - target.fh, ny))
-            else:
-                hero = state.resolver.resolve_hero_panel()
-                nx = max(hero[0] - VIRTUAL_WIDTH, min(hero[0] + hero[2] + VIRTUAL_WIDTH - target.fw, nx))
-                ny = max(hero[1] - VIRTUAL_HEIGHT, min(hero[1] + hero[3] + VIRTUAL_HEIGHT - target.fh, ny))
+            x, y, w, h = target.float_rect()
+            nx, ny = clamp_position(target, x + dx, y + dy, w, h)
             target.set_position(nx, ny, state.resolver, state.doc)
+            state.refresh_all()
 
     def component_at(pos):
         """Retorna o componente topmost sob o cursor, dentro da Ã¡rea de design."""
@@ -2476,7 +3963,7 @@ def main():
 
     def overhead_hit(pos):
         """Retorna 'cast' ou 'overhead' se o mouse estiver sobre um elemento overhead."""
-        if not design_rect.collidepoint(pos):
+        if not doc.is_engine_hud or not design_rect.collidepoint(pos):
             return None
         mx, my = to_virtual(pos[0], pos[1])
         cx, cy, cw, ch = cast_bar_rect()
@@ -2490,6 +3977,8 @@ def main():
         return None
 
     hovered_overhead = None
+    tab_hits = []   # (retangulo, caminho) das abas desenhadas no quadro anterior
+    pygame.display.set_caption(f"Caldera - {doc_label(doc.path)}")
 
     running = True
     clock = pygame.time.Clock()
@@ -2507,10 +3996,16 @@ def main():
         btn_snap.rect.topleft = (screen_width - layer_w() - 8 - 90, 6)
         btn_grid.rect.topleft = (screen_width - layer_w() - 8 - 180, 6)
         btn_bind_to_player.rect.topleft = (screen_width - layer_w() - 8 - 380, 6)
+        for btn in menu_buttons:
+            btn.rect.y = chrome_h() + 8
+        btn_export_menu.text = f"Export {os.path.basename(doc.path)}"[:26]
+        layout_panel_buttons()
 
         for btn in buttons:
             btn.update(mouse_pos)
         for btn in menu_buttons:
+            btn.update(mouse_pos)
+        for btn in panel_buttons:
             btn.update(mouse_pos)
 
         update_scale()
@@ -2551,12 +4046,30 @@ def main():
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                running = False
+                dirty = [os.path.basename(d.path) for d, _st in open_docs.values() if d.is_dirty()]
+                if dirty and not quit_warned:
+                    quit_warned = True
+                    notify("Alterações não gravadas em " + ", ".join(dirty) + " (E grava). Feche de novo para sair.", 360)
+                else:
+                    running = False
 
             elif event.type == pygame.VIDEORESIZE:
                 screen_width, screen_height = event.size
                 screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
                 update_scale()
+
+            elif modal is not None and event.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN,
+                                                      pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
+                # janela modal aberta: so' ela recebe teclado e mouse
+                result = modal.handle_event(event, (screen_width, screen_height))
+                if isinstance(modal, FileBrowser):
+                    if result:
+                        picked = result[1] if result[0] == 'pick' else None
+                        modal = None
+                        if picked:
+                            switch_document(picked)
+                elif result in ('ok', 'cancel'):
+                    modal = None
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
@@ -2565,6 +4078,17 @@ def main():
                         if btn.handle_click(event.pos):
                             handled = True
                             break
+                    if not handled and show_layers:
+                        for btn in panel_buttons:
+                            if btn.handle_click(event.pos):
+                                handled = True
+                                break
+                    if not handled:
+                        for trect, tpath in tab_hits:
+                            if trect.collidepoint(event.pos):
+                                switch_document(tpath)
+                                handled = True
+                                break
                     if not handled and menu_open:
                         for btn in menu_buttons:
                             if btn.handle_click(event.pos):
@@ -2577,11 +4101,15 @@ def main():
                     if handled:
                         continue
 
-                    # Painel de layers: inicia drag-and-drop de layer
+                    # Painel de layers: clique seleciona, arrastar reordena o z-index
                     if layer_panel.rect.collidepoint(event.pos) and show_layers:
                         if layer_panel.start_drag(event.pos):
-                            state.select_only(layer_panel.selected)
+                            if pygame.key.get_mods() & pygame.KMOD_CTRL:
+                                state.toggle_select(layer_panel.selected)
+                            else:
+                                state.select_only(layer_panel.selected)
                             continue
+                        continue
 
                     # Handles de redimensionamento primeiro (somente entre selecionados)
                     clicked_handle = None
@@ -2596,8 +4124,7 @@ def main():
                     if clicked_handle and handle_comp:
                         handle_comp.resizing = True
                         handle_comp.resize_handle = clicked_handle
-                        r = handle_comp.screen_rect()
-                        handle_comp.resize_start_rect = (r.x, r.y, r.w, r.h)
+                        handle_comp.resize_start_rect = handle_comp.float_rect()
                         handle_comp.resize_start_mouse = to_virtual(event.pos[0], event.pos[1])
                         continue
 
@@ -2614,8 +4141,8 @@ def main():
                         for c in state.components:
                             if c.selector in state.selected_set:
                                 c.dragging = True
-                                r = c.screen_rect()
-                                c.offset = (r.x - vx, r.y - vy)
+                                r = c.float_rect()
+                                c.offset = (r[0] - vx, r[1] - vy)
                         if not lock_layer_order and len(state.selected_set) == 1:
                             for c in state.components:
                                 if c.selector == comp.selector:
@@ -2632,8 +4159,8 @@ def main():
                             for c in state.components:
                                 if c.selector == selector:
                                     c.dragging = True
-                                    r = c.screen_rect()
-                                    c.offset = (r.x - vx, r.y - vy)
+                                    r = c.float_rect()
+                                    c.offset = (r[0] - vx, r[1] - vy)
                                     break
                         elif not ctrl:
                             state.clear_selection()
@@ -2662,11 +4189,16 @@ def main():
                     layer_panel.update_drag(event.pos)
                     continue
 
+                dragging_now = {c.selector for c in state.components if c.dragging}
                 for comp in state.components:
                     if comp.resizing and comp.resize_handle:
                         mx, my = to_virtual(event.pos[0], event.pos[1])
                         apply_resize(comp, comp.resize_handle, mx, my)
+                        state.refresh_all()
                     elif comp.dragging:
+                        # filho de quem tambem esta sendo arrastado acompanha o pai sozinho
+                        if any(a in dragging_now for a in state.ancestors(comp.selector)):
+                            continue
                         vx, vy = to_virtual(event.pos[0], event.pos[1])
                         nx = vx + comp.offset[0]
                         ny = vy + comp.offset[1]
@@ -2674,17 +4206,9 @@ def main():
                             nx = snap(nx, grid_size)
                             ny = snap(ny, grid_size)
                         # Converte posição visual para o espaço do componente
-                        if comp.bind_to_player:
-                            nx = max(PLAYER_POS[0] - 500.0, min(PLAYER_POS[0] + 500.0, nx))
-                            ny = max(PLAYER_POS[1] - 500.0, min(PLAYER_POS[1] + 500.0, ny))
-                        elif comp.is_top:
-                            nx = max(0.0, min(VIRTUAL_WIDTH - comp.fw, nx))
-                            ny = max(0.0, min(VIRTUAL_HEIGHT - comp.fh, ny))
-                        else:
-                            hero = state.resolver.resolve_hero_panel()
-                            nx = max(hero[0] - VIRTUAL_WIDTH, min(hero[0] + hero[2] + VIRTUAL_WIDTH - comp.fw, nx))
-                            ny = max(hero[1] - VIRTUAL_HEIGHT, min(hero[1] + hero[3] + VIRTUAL_HEIGHT - comp.fh, ny))
+                        nx, ny = clamp_position(comp, nx, ny, *comp.float_rect()[2:])
                         comp.set_position(nx, ny, state.resolver, state.doc)
+                        state.refresh_all()
 
             elif event.type == pygame.KEYDOWN:
                 mods = pygame.key.get_mods()
@@ -2703,12 +4227,40 @@ def main():
                     nudge_selected(step, 0)
                 elif event.key == pygame.K_PAGEUP:
                     if ctrl:
-                        layer_panel.move_selected(-1)
+                        move_selected_z(1)
                 elif event.key == pygame.K_PAGEDOWN:
                     if ctrl:
-                        layer_panel.move_selected(1)
-                elif event.key == pygame.K_e:
+                        move_selected_z(-1)
+                elif event.key == pygame.K_e or (ctrl and event.key == pygame.K_s):
                     export()
+                elif ctrl and event.key == pygame.K_o:
+                    open_browser()
+                elif ctrl and event.key == pygame.K_n:
+                    open_new_document_dialog()
+                elif ctrl and event.key == pygame.K_d:
+                    duplicate_selected()
+                elif event.key == pygame.K_n:
+                    open_new_element_dialog()
+                elif event.key in (pygame.K_DELETE, pygame.K_KP_PERIOD):
+                    delete_selected()
+                elif event.key == pygame.K_F2:
+                    open_rename_dialog()
+                elif event.key == pygame.K_t:
+                    open_content_dialog()
+                elif event.key == pygame.K_r:
+                    open_parent_dialog()
+                elif event.key == pygame.K_w:
+                    cycle_selected_widget()
+                elif event.key == pygame.K_F5:
+                    reload_document(force=bool(shift))
+                elif event.key == pygame.K_F1:
+                    show_help = not show_help
+                elif event.key == pygame.K_TAB:
+                    paths = tab_paths()
+                    if len(paths) > 1:
+                        cur = os.path.abspath(doc.path)
+                        i = paths.index(cur) if cur in paths else 0
+                        switch_document(paths[(i + (-1 if shift else 1)) % len(paths)])
                 elif event.key == pygame.K_l:
                     toggle_layers()
                 elif event.key == pygame.K_k:
@@ -2771,22 +4323,44 @@ def main():
                 pitch_key_timer = ZOOM_REPEAT_INTERVAL
 
         # Render
+        state.refresh_all()
         screen.fill((18, 19, 22))
 
         # Top bar
         pygame.draw.rect(screen, (28, 30, 34), (0, 0, screen_width, top_bar_height))
         pygame.draw.line(screen, (139, 90, 43), (0, top_bar_height), (screen_width, top_bar_height), 2)
 
+        # Abas dos documentos (.css do projeto e os abertos na sessao)
+        tab_hits = []
+        paths = tab_paths()
+        if len(paths) > 1:
+            pygame.draw.rect(screen, (24, 26, 30), (0, top_bar_height + 1, screen_width, tabs_bar_height))
+            tab_w = max(80, min(190, (screen_width - 16) // len(paths)))
+            cur_path = os.path.abspath(doc.path)
+            for i, tp in enumerate(paths):
+                entry = open_docs.get(tp)
+                label = os.path.basename(tp) + (' *' if entry and entry[0].is_dirty() else '')
+                trect = pygame.Rect(8 + i * (tab_w + 2), top_bar_height + 4, tab_w, tabs_bar_height - 4)
+                active = tp == cur_path
+                pygame.draw.rect(screen, (60, 56, 50) if active else (38, 40, 46), trect,
+                                 border_top_left_radius=4, border_top_right_radius=4)
+                pygame.draw.rect(screen, (255, 220, 80) if active else (80, 70, 60), trect, 1,
+                                 border_top_left_radius=4, border_top_right_radius=4)
+                tsurf = font.render(label, True, (240, 230, 210) if active else (160, 160, 165))
+                screen.blit(tsurf, (trect.x + 8, trect.y + 4), (0, 0, trect.w - 12, 20))
+                tab_hits.append((trect, tp))
+
         # Menu dropdown
         if menu_height > 1:
-            pygame.draw.rect(screen, (34, 36, 42), (0, top_bar_height, screen_width, int(menu_height)))
-            pygame.draw.line(screen, (80, 70, 60), (0, top_bar_height + int(menu_height) - 1),
-                             (screen_width, top_bar_height + int(menu_height) - 1), 1)
+            pygame.draw.rect(screen, (34, 36, 42), (0, chrome_h(), screen_width, int(menu_height)))
+            pygame.draw.line(screen, (80, 70, 60), (0, chrome_h() + int(menu_height) - 1),
+                             (screen_width, chrome_h() + int(menu_height) - 1), 1)
 
         for btn in buttons:
             btn.draw(screen, font)
-        for btn in menu_buttons:
-            btn.draw(screen, font)
+        if menu_height > 1:
+            for btn in menu_buttons:
+                btn.draw(screen, font)
 
         # Design area background
         pygame.draw.rect(screen, (22, 23, 26), design_rect)
@@ -2798,25 +4372,36 @@ def main():
             for y in range(design_rect.top, design_rect.bottom, int(grid_size * scale_y)):
                 pygame.draw.line(screen, (45, 45, 50), (design_rect.left, y), (design_rect.right, y))
 
-        # Hero panel reference outline
-        hero = state.resolver.resolve_hero_panel()
-        hpsr = to_screen(pygame.Rect(int(hero[0]), int(hero[1]), int(hero[2]), int(hero[3])))
-        if hpsr.colliderect(design_rect):
-            pygame.draw.rect(screen, (107, 143, 94), hpsr, 2)
-            label = font.render("Hero Panel (reference)", True, (107, 143, 94))
-            screen.blit(label, (hpsr.x + 4, hpsr.y + 4))
+        # Referencia do pai: contorno verde do retangulo que serve de base para as %
+        # do elemento selecionado (no HUD do motor, sem selecao, o #hero-panel)
+        ref_sels = []
+        for c in state.selected_components():
+            if c.parent is not None and c.parent not in ref_sels:
+                ref_sels.append(c.parent)
+        if not ref_sels and doc.is_engine_hud and '#hero-panel' in doc.rules:
+            ref_sels = ['#hero-panel']
+        for ref in ref_sels:
+            ref_rect = state.resolver.resolve(ref)
+            hpsr = to_screen(pygame.Rect(int(ref_rect[0]), int(ref_rect[1]), int(ref_rect[2]), int(ref_rect[3])))
+            if hpsr.colliderect(design_rect):
+                pygame.draw.rect(screen, (107, 143, 94), hpsr, 2)
+                ref_name = "Hero Panel (reference)" if ref == '#hero-panel' and doc.is_engine_hud else f"pai: {ref}"
+                label = font.render(ref_name, True, (107, 143, 94))
+                screen.blit(label, (hpsr.x + 4, hpsr.y + 4))
 
         # Components: renderiza numa surface virtual e faz stretch para a área de design
         virtual_surf = pygame.Surface((int(VIRTUAL_WIDTH), int(VIRTUAL_HEIGHT)), pygame.SRCALPHA)
         virtual_surf.fill((0, 0, 0, 0))
         # Player placeholder primeiro: na engine o sprite e' mundo e a HUD (ImGui)
         # e' sempre desenhada por cima, inclusive as barras sobre a cabeca.
-        renderer.draw_player_placeholder(virtual_surf, PLAYER_CENTER, PLAYER_BASE, PLAYER_SPRITE_H, dt)
+        if player_visible():
+            renderer.draw_player_placeholder(virtual_surf, PLAYER_CENTER, PLAYER_BASE, PLAYER_SPRITE_H, dt)
         for comp in state.components:
-            renderer.draw_component(virtual_surf, comp.selector, comp.screen_rect())
+            renderer.draw_element(virtual_surf, comp, comp.draw_rect())
 
         # Loading bar reference (posição fixa da engine, não editável)
-        renderer.draw_loading_bar_reference(virtual_surf)
+        if doc.is_engine_hud:
+            renderer.draw_loading_bar_reference(virtual_surf)
 
         scaled_surf = pygame.transform.scale(virtual_surf, design_rect.size)
         screen.blit(scaled_surf, design_rect.topleft)
@@ -2829,11 +4414,13 @@ def main():
             if is_selected:
                 pygame.draw.rect(screen, (255, 220, 80), sr, 2)
                 draw_handles(screen, comp)
-            z_surf = font.render(f"z:{comp.z_index}", True, (255, 220, 80))
-            screen.blit(z_surf, (sr.x + sr.w - z_surf.get_width() - 4, sr.y + 2))
+            # o z de cada elemento so' aparece em documentos pequenos (ou no selecionado)
+            if is_selected or len(state.components) <= 16:
+                z_surf = font.render(f"z:{comp.z_index}", True, (255, 220, 80))
+                screen.blit(z_surf, (sr.x + sr.w - z_surf.get_width() - 4, sr.y + 2))
 
         # Highlight extra para overhead (área do arco pode ser maior que o rect CSS)
-        if hovered_overhead or state.selected_set & {'#cast-bar', '#overhead-hp-sp'}:
+        if doc.is_engine_hud and (hovered_overhead or state.selected_set & {'#cast-bar', '#overhead-hp-sp'}):
             for name, rect_func in [('cast', cast_bar_rect), ('overhead', overhead_bar_rect)]:
                 selector = '#cast-bar' if name == 'cast' else '#overhead-hp-sp'
                 is_selected = selector in state.selected_set
@@ -2850,6 +4437,17 @@ def main():
         # Layer panel
         if show_layers:
             layer_panel.draw(screen, font, header_font)
+            for btn in panel_buttons:
+                btn.draw(screen, small_font)
+
+        # Avisos do documento (pai inexistente, ciclo de --parent, widget desconhecido...)
+        warn_y = screen_height - 44
+        for text in reversed(list(state.resolver.warnings)[:4]):
+            wsurf = font.render("! " + text, True, (255, 170, 60))
+            wrect = wsurf.get_rect(bottomleft=(8, warn_y + 20))
+            pygame.draw.rect(screen, (0, 0, 0), wrect.inflate(8, 2))
+            screen.blit(wsurf, wrect)
+            warn_y -= 20
 
         # Message
         if message_timer > 0:
@@ -2867,6 +4465,9 @@ def main():
         if state.selected_set:
             targets = [state.selector_to_component[s] for s in state.selected_set]
             bind_mode = "Player" if all(c.bind_to_player for c in targets) else "HUD"
+            if len(targets) == 1:
+                t = targets[0]
+                selected_names += f" [{t.widget}" + (f", pai {t.parent}" if t.parent else "") + "]"
         status_text = (f"Snap: {'ON' if snap_enabled else 'OFF'} (G)   "
                        f"Layers: {'ON' if show_layers else 'OFF'} (L)   "
                        f"Lock: {'ON' if lock_layer_order else 'OFF'} (K)   "
@@ -2876,6 +4477,26 @@ def main():
                        f"Bind: {bind_mode}")
         snap_text = font.render(status_text, True, (200, 200, 200))
         screen.blit(snap_text, (8, screen_height - 20))
+
+        if show_help:
+            help_lines = [
+                "Atalhos (F1 fecha)",
+                "Arrastar: mover   |   alças do selecionado: redimensionar   |   setas: 1 px (Shift 10)",
+                "N novo elemento   Ctrl+D duplicar   Del apagar   F2 renomear id   T texto/imagem   R pai   W tipo (--widget)",
+                "Ctrl+PgUp / Ctrl+PgDn: sobe / desce no z-index   (ou arraste na lista de elementos)",
+                "Ctrl+O abrir .css   Ctrl+N novo .css   Tab / Shift+Tab troca de aba   F5 recarrega do disco",
+                "E ou Ctrl+S grava   B preso ao jogador   G grade   L lista   K trava ordem   +/-/0 zoom   [ ] P inclinação",
+            ]
+            hw = max(font.size(t)[0] for t in help_lines) + 24
+            hr = pygame.Rect(0, 0, hw, 24 * len(help_lines) + 12)
+            hr.center = (design_rect.centerx, design_rect.centery)
+            pygame.draw.rect(screen, (14, 15, 18), hr, border_radius=6)
+            pygame.draw.rect(screen, (139, 90, 43), hr, 2, border_radius=6)
+            for i, t in enumerate(help_lines):
+                screen.blit(font.render(t, True, (240, 230, 210) if i else (255, 220, 80)), (hr.x + 12, hr.y + 10 + i * 24))
+
+        if modal is not None:
+            modal.draw(screen, font, header_font, (screen_width, screen_height))
 
         pygame.display.flip()
         # CALDERA_SCREENSHOT=/caminho.png: salva o quadro apos alguns frames e sai
