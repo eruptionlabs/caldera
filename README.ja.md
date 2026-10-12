@@ -127,7 +127,7 @@ Caldera はファイルをそのまま保ちます。コメント、空行、ル
 ゲーム画面と並べて比較するには、HUD 付きでエンジンをキャプチャし、同じ解像度で Caldera を描画します：
 
 ```bash
-ERUPTION_TEST_SWAP_SHOT=game.png,300 ERUPTION_TEST_EXIT_FRAME=330 ./eruption-engine --map parana_field
+ERUPTION_TEST_SWAP_SHOT=game.png,300 ERUPTION_TEST_EXIT_FRAME=330 ./eruption-engine --project projects/parana_field --map parana_field_lite
 CALDERA_VIRTUAL=1280x720 CALDERA_SCREENSHOT=caldera.png tools/caldera/run.sh
 ```
 

@@ -127,7 +127,7 @@ O Caldera preserva o arquivo como estava: comentários, linhas em branco, a orde
 Para comparar com o jogo lado a lado, capture a engine com a HUD e renderize o Caldera na mesma resolução:
 
 ```bash
-ERUPTION_TEST_SWAP_SHOT=jogo.png,300 ERUPTION_TEST_EXIT_FRAME=330 ./eruption-engine --map parana_field
+ERUPTION_TEST_SWAP_SHOT=jogo.png,300 ERUPTION_TEST_EXIT_FRAME=330 ./eruption-engine --project projects/parana_field --map parana_field_lite
 CALDERA_VIRTUAL=1280x720 CALDERA_SCREENSHOT=caldera.png tools/caldera/run.sh
 ```
 

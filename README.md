@@ -127,7 +127,7 @@ Caldera keeps the file as it was: comments, blank lines, the order of the rules 
 To compare against the game side by side, capture the engine with its HUD and render Caldera at the same resolution:
 
 ```bash
-ERUPTION_TEST_SWAP_SHOT=game.png,300 ERUPTION_TEST_EXIT_FRAME=330 ./eruption-engine --map parana_field
+ERUPTION_TEST_SWAP_SHOT=game.png,300 ERUPTION_TEST_EXIT_FRAME=330 ./eruption-engine --project projects/parana_field --map parana_field_lite
 CALDERA_VIRTUAL=1280x720 CALDERA_SCREENSHOT=caldera.png tools/caldera/run.sh
 ```
 
